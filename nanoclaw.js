@@ -878,8 +878,53 @@ async function loadAgentIdentity() {
     }
     var tgCount = Object.keys(tenantGroups).length;
     if (tgCount > 0) console.log('[nc] Tenant→group map: ' + tgCount + ' tenant(s) with groups');
+
+    // ADAPTIVE TOOLHUB: Fetch latest tool registry from Mothership at boot
+    await fetchToolRegistry().catch(function(e) {
+      console.warn('[nc] Initial toolhub fetch failed:', e.message || e);
+    });
   } catch (e) { console.warn('[nc] Identity load failed:', e.message || e); }
 }
+
+// ADAPTIVE TOOLHUB: Dynamic tool discovery from Mothership SSOT
+var dynamicTools = null;
+var toolRegistryHash = null;
+
+async function fetchToolRegistry() {
+  if (!MOTHERSHIP || !MCP_KEY) return null;
+  try {
+    var result = await httpsPost(MOTHERSHIP + '/api/gateway', {
+      'Content-Type': 'application/json',
+      'X-MCP-API-Key': MCP_KEY,
+    }, { method: 'tools/list' }, 10000);
+
+    if (result && result.result && result.result.tools) {
+      var tools = result.result.tools;
+      var meta = result.result._meta || {};
+      var newHash = meta.registryHash || '';
+
+      if (newHash && newHash !== toolRegistryHash) {
+        console.log('[nc] Tool registry updated: ' + tools.length + ' tools (hash: ' + newHash + ')');
+        toolRegistryHash = newHash;
+      }
+
+      dynamicTools = tools.map(function(t) {
+        return {
+          name: t.name,
+          description: t.description || '',
+          input_schema: t.inputSchema || { type: 'object', properties: {} },
+        };
+      });
+      console.log('[nc] Adaptive toolhub: ' + dynamicTools.length + ' tools from Mothership SSOT');
+      return dynamicTools;
+    }
+  } catch (err) {
+    console.warn('[nc] Toolhub fetch failed (using hardcoded fallback):', err.message || err);
+  }
+  return null;
+}
+
+setInterval(function() { fetchToolRegistry().catch(function() {}); }, 30 * 60 * 1000);
 
 setInterval(function() { loadAgentIdentity().catch(function() {}); }, 5 * 60 * 1000);
 
