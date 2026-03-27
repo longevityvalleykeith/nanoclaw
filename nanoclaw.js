@@ -296,6 +296,16 @@ var ALL_TOOLS = [
   { name: 'list_scheduled_tasks', description: 'List all pending scheduled follow-ups and tasks.', input_schema: { type: 'object', properties: {} } },
   { name: 'verify_response', description: 'Self-check draft against KB and practice rules before delivering.', input_schema: { type: 'object', properties: { draft_response: { type: 'string', description: 'Draft to verify' } }, required: ['draft_response'] } },
     {
+      name: 'generate_speech',
+      description: 'Generate voice/speech audio from text. Returns audio URL for Telegram sendVoice. Use for warm greetings, promotional messages, or personalized voice content.',
+      input_schema: { type: 'object', properties: { text: { type: 'string', description: 'Text to convert to speech (max 5000 chars)' }, voice_id: { type: 'string', description: 'Voice preset (optional)' } }, required: ['text'] }
+    },
+    {
+      name: 'generate_video',
+      description: 'Generate branded video from image + text prompt via Hailuo I2V. Returns taskId (async, 2-4 min). Use for product demos, wellness content, branded intros.',
+      input_schema: { type: 'object', properties: { prompt: { type: 'string', description: 'Video description with camera commands like [Static shot], [Push in]' }, first_frame_image: { type: 'string', description: 'Image URL as starting frame' }, duration: { type: 'number', description: 'Duration: 6 or 10 seconds' } }, required: ['prompt'] }
+    },
+    {
       name: 'report_incident',
       description: 'Report a violation, failure, or anomaly to Mothership. Use when: cross-tenant data leak, PHI violation, hallucinated data, tool failure.',
       input_schema: {
@@ -337,7 +347,7 @@ function sanitize(str) {
 
 async function executeToolCall(toolName, input, tenant, correlationId) {
   // SEC-06: Validate tool name against allowlist
-  var allowedTools = ['query_knowledge', 'get_patient_roster', 'create_patient', 'start_intake', 'ask_wellness_question', 'get_synthesized_capsule', 'task_mirror', 'verify_response', 'send_to_group', 'schedule_followup', 'list_scheduled_tasks', 'report_incident', 'request_capability'];
+  var allowedTools = ['query_knowledge', 'get_patient_roster', 'create_patient', 'start_intake', 'ask_wellness_question', 'get_synthesized_capsule', 'task_mirror', 'verify_response', 'send_to_group', 'schedule_followup', 'list_scheduled_tasks', 'report_incident', 'request_capability', 'generate_speech', 'generate_video'];
   if (allowedTools.indexOf(toolName) === -1) {
     return Promise.resolve({ error: 'Tool not in allowlist: ' + toolName });
   }
@@ -386,11 +396,17 @@ async function executeToolCall(toolName, input, tenant, correlationId) {
       }, GATEWAY_TIMEOUT); // 120s — capsule runs full flywheel
 
     case 'send_to_group': {
-      // TENANT-SCOPED: Only send to THIS tenant's group (ML-175 fix)
+      // TENANT-SCOPED + CONTEXT-AWARE: Send to the group where the conversation is happening
       var groupChatId = null;
-      var myGroups = tenantGroups[tenant.tenantId] || [];
-      if (myGroups.length > 0) {
-        groupChatId = myGroups[0];
+      // If the current chat IS a group, send back to it (not a random group)
+      if (chatId < 0) {
+        groupChatId = String(chatId);
+      } else {
+        // DM context — pick the first tenant group
+        var myGroups = tenantGroups[tenant.tenantId] || [];
+        if (myGroups.length > 0) {
+          groupChatId = myGroups[0];
+        }
       }
       if (!groupChatId) {
         try {
@@ -455,6 +471,20 @@ async function executeToolCall(toolName, input, tenant, correlationId) {
       }, 15000);
 
     
+    case 'generate_speech':
+      return httpsPost(MOTHERSHIP + '/api/gateway/generate_speech', gwHeaders, {
+        text: input.text || input.message || '',
+        voice_id: input.voice_id || input.voiceId || undefined,
+      }, 30000);
+
+    case 'generate_video':
+      return httpsPost(MOTHERSHIP + '/api/gateway/generate_video', gwHeaders, {
+        prompt: input.prompt || '',
+        first_frame_image: input.first_frame_image || input.imageUrl || '',
+        duration: input.duration || 6,
+        resolution: input.resolution || '720P',
+      }, 30000);
+
     case 'report_incident':
       return httpsPost(MOTHERSHIP + '/api/gateway/report_incident', gwHeaders, {
         severity: input.severity,
