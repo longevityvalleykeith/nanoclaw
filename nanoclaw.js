@@ -415,7 +415,12 @@ async function discoverTools() {
       for (var i = 0; i < HARDCODED_TOOLS.length; i++) {
         if (!discoveredNames.has(HARDCODED_TOOLS[i].name)) discovered.push(HARDCODED_TOOLS[i]);
       }
-      ALL_TOOLS = discovered;
+      if (discovered.length >= 10) {
+        ALL_TOOLS = discovered;
+        console.log('[nc] Tool discovery: ' + discovered.length + ' tools accepted');
+      } else {
+        console.warn('[nc] Tool discovery: only ' + discovered.length + ' tools — keeping existing ' + ALL_TOOLS.length);
+      }
       // Update scoped tool lists
       TOOLS_COS = ALL_TOOLS;
       TOOLS_EXPERT = ALL_TOOLS.filter(function(t) { return t.name !== 'task_mirror'; });
@@ -647,7 +652,7 @@ async function executeToolCall(toolName, input, tenant, correlationId, chatId) {
 
     default:
       // ADAPTIVE PROXY: Any tool from Mothership SSOT dispatched via generic gateway
-      if (dynamicTools && dynamicTools.find(function(t) { return t.name === toolName; })) {
+      if (ALL_TOOLS && ALL_TOOLS.find(function(t) { return t.name === toolName; })) {
         console.log('[nc] Dynamic tool dispatch: ' + toolName + ' → gateway');
         return httpsPost(MOTHERSHIP + '/api/gateway/' + toolName, gwHeaders, input, 30000);
       }
@@ -951,7 +956,8 @@ function callAnthropic(systemPrompt, messages, tools, tenant, correlationId, cha
       var toolPromises = toolBlocks.map(function(tb) {
         console.log('[nc] Tool: ' + tb.name + '(' + JSON.stringify(tb.input).slice(0, 60) + ')');
         return executeToolCall(tb.name, tb.input, tenant, correlationId, chatId).then(function(toolResult) {
-          return { type: 'tool_result', tool_use_id: tb.id, content: JSON.stringify(toolResult).slice(0, 3000) };
+          var resultStr = JSON.stringify(toolResult).slice(0, 3000).replace(/<think>[^]*?<\/think>/g, '').replace(/<\/?think>/g, '');
+          return { type: 'tool_result', tool_use_id: tb.id, content: resultStr };
         });
       });
 
@@ -1110,6 +1116,8 @@ async function loadAgentIdentity() {
     var allTenantIds = new Set();
     for (var ck in CHAT_TENANT_MAP) { if (CHAT_TENANT_MAP[ck]) allTenantIds.add(CHAT_TENANT_MAP[ck].tenantId); }
     allTenantIds.add(TENANT_ID);
+    var _prevLessons = consciousnessLessons.slice();
+    var _prevConsciousness = Object.assign({}, agentConsciousness);
     consciousnessLessons = [];
     for (var tid of allTenantIds) {
       var lessonsUrl = SUPABASE_URL + '/rest/v1/agent_event_bus?event_type=eq.consciousness.update&status=eq.completed&tenant_id=eq.' + tid + '&select=payload&order=created_at.desc&limit=10';
@@ -1129,8 +1137,14 @@ async function loadAgentIdentity() {
       tenantConsciousness[tid] = { lessons: Array.from(new Set(tLessons)), consciousness: tConsciousness };
       // Primary tenant also populates the global (backward compat)
       if (tid === TENANT_ID) {
-        consciousnessLessons = tenantConsciousness[tid].lessons;
-        Object.assign(agentConsciousness, tConsciousness);
+        if (tenantConsciousness[tid].lessons.length > 0) {
+          consciousnessLessons = tenantConsciousness[tid].lessons;
+          Object.assign(agentConsciousness, tConsciousness);
+        } else {
+          consciousnessLessons = _prevLessons;
+          Object.assign(agentConsciousness, _prevConsciousness);
+          console.warn('[nc] Consciousness reload empty — keeping ' + _prevLessons.length + ' existing lessons');
+        }
       }
     }
     var totalLessons = Object.values(tenantConsciousness).reduce(function(s, t) { return s + t.lessons.length; }, 0);
