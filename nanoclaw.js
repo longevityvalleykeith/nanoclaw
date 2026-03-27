@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * NanoClaw v10 — Entity-Scoped Attention Graph Memory (ESAGM)
+ * NanoClaw v11 — Entity-Scoped Attention Graph Memory (ESAGM)
  *
  * Agent 0 Chief of Staff: autonomous dual-persona (COS + Expert Rep)
  * with entity-isolated multi-turn memory, hierarchy-scoped tool access,
@@ -18,18 +18,30 @@
 const https = require('https');
 const http = require('http');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+const NANOCLAW_VERSION = 'v11.2.0'; // S1-S4 + T2A direct voice, chatId passthrough, 5-provider LLM router
+const TENANT_MODE = process.env.TENANT_MODE || 'multi';
+const BOT_USERNAME = process.env.BOT_USERNAME || 'LongevityValley_Bot';
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const MOTHERSHIP = process.env.LV_BACKEND_URL || 'https://app.longevityvalley.ai';
 const MCP_KEY = process.env.MCP_API_KEY;
 
 // Per-tenant MCP key map (prevents cross-tenant data leak)
-var TENANT_MCP_KEYS = {
-  'abe1b946-6643-4acc-9cc1-6a47336d31d8': process.env.MCP_API_KEY_AMANI || MCP_KEY,   // Amani Wellness
-  '3cc281be-aafc-4579-9edf-521659306145': process.env.MCP_API_KEY_MAGFIELD || MCP_KEY,  // DR MAGfield
-  '313a6002-5718-4c28-8fe1-82f831b83cdf': MCP_KEY,                                      // Keith LV (default)
-};
-function getMcpKey(tenantId) { return TENANT_MCP_KEYS[tenantId] || MCP_KEY; }
+var TENANT_MCP_KEYS = {};
+if (TENANT_MODE === 'multi') {
+  TENANT_MCP_KEYS = {
+    'abe1b946-6643-4acc-9cc1-6a47336d31d8': process.env.MCP_API_KEY_AMANI || MCP_KEY,   // Amani Wellness
+    '3cc281be-aafc-4579-9edf-521659306145': process.env.MCP_API_KEY_MAGFIELD || MCP_KEY,  // DR MAGfield
+    '313a6002-5718-4c28-8fe1-82f831b83cdf': MCP_KEY,                                      // Keith LV (default)
+  };
+}
+function getMcpKey(tenantId) {
+  if (TENANT_MODE === 'single') return MCP_KEY;
+  return TENANT_MCP_KEYS[tenantId] || MCP_KEY;
+}
 if (!MCP_KEY) { console.error('[nc] FATAL: MCP_API_KEY not set'); process.exit(1); }
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
 const MINIMAX_KEY = process.env.MINIMAX_API_KEY || '';
@@ -46,6 +58,58 @@ const HEALTH_PORT = 3002;
 const GATEWAY_TIMEOUT = 120000;
 
 if (!TG_TOKEN) { console.error('[nc] FATAL: TELEGRAM_BOT_TOKEN not set'); process.exit(1); }
+
+// ============================================================================
+// S1: PROCESS CRASH RECOVERY
+// ============================================================================
+process.on('uncaughtException', function(err) {
+  console.error('[nc] UNCAUGHT EXCEPTION:', err.message, err.stack);
+  emitAudit('nanoclaw.crash', { type: 'uncaughtException', error: err.message });
+  // Give audit time to flush, then exit with error code
+  setTimeout(function() { process.exit(1); }, 2000);
+});
+process.on('unhandledRejection', function(reason) {
+  console.error('[nc] UNHANDLED REJECTION:', reason);
+  emitAudit('nanoclaw.crash', { type: 'unhandledRejection', error: String(reason) });
+});
+
+// ============================================================================
+// S2: GRACEFUL SHUTDOWN
+// ============================================================================
+var healthServer = null; // assigned later at startup
+var isShuttingDown = false;
+function gracefulShutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log('[nc] ' + signal + ' received — graceful shutdown');
+  emitAudit('nanoclaw.shutdown', { signal: signal, version: NANOCLAW_VERSION });
+  if (healthServer) try { healthServer.close(); } catch(e) {}
+  setTimeout(function() { process.exit(0); }, 3000);
+}
+process.on('SIGTERM', function() { gracefulShutdown('SIGTERM'); });
+process.on('SIGINT', function() { gracefulShutdown('SIGINT'); });
+
+// ============================================================================
+// S3: CIRCUIT BREAKER ON MOTHERSHIP GATEWAY
+// ============================================================================
+var gatewayFailures = 0;
+var gatewayCircuitOpenUntil = 0;
+var GATEWAY_CB_THRESHOLD = 5;
+var GATEWAY_CB_COOLDOWN_MS = 60000; // 1 minute
+function isGatewayCircuitOpen() {
+  return Date.now() < gatewayCircuitOpenUntil;
+}
+function recordGatewaySuccess() {
+  gatewayFailures = 0;
+}
+function recordGatewayFailure() {
+  gatewayFailures++;
+  if (gatewayFailures >= GATEWAY_CB_THRESHOLD) {
+    gatewayCircuitOpenUntil = Date.now() + GATEWAY_CB_COOLDOWN_MS;
+    console.warn('[nc] Circuit breaker OPEN on Mothership gateway after ' + gatewayFailures + ' failures');
+    emitAudit('nanoclaw.circuit_open', { failures: gatewayFailures, cooldownMs: GATEWAY_CB_COOLDOWN_MS });
+  }
+}
 
 // ============================================================================
 // TENANT MAPPING
@@ -296,16 +360,6 @@ var ALL_TOOLS = [
   { name: 'list_scheduled_tasks', description: 'List all pending scheduled follow-ups and tasks.', input_schema: { type: 'object', properties: {} } },
   { name: 'verify_response', description: 'Self-check draft against KB and practice rules before delivering.', input_schema: { type: 'object', properties: { draft_response: { type: 'string', description: 'Draft to verify' } }, required: ['draft_response'] } },
     {
-      name: 'generate_speech',
-      description: 'Generate voice/speech audio from text. Returns audio URL for Telegram sendVoice. Use for warm greetings, promotional messages, or personalized voice content.',
-      input_schema: { type: 'object', properties: { text: { type: 'string', description: 'Text to convert to speech (max 5000 chars)' }, voice_id: { type: 'string', description: 'Voice preset (optional)' } }, required: ['text'] }
-    },
-    {
-      name: 'generate_video',
-      description: 'Generate branded video from image + text prompt via Hailuo I2V. Returns taskId (async, 2-4 min). Use for product demos, wellness content, branded intros.',
-      input_schema: { type: 'object', properties: { prompt: { type: 'string', description: 'Video description with camera commands like [Static shot], [Push in]' }, first_frame_image: { type: 'string', description: 'Image URL as starting frame' }, duration: { type: 'number', description: 'Duration: 6 or 10 seconds' } }, required: ['prompt'] }
-    },
-    {
       name: 'report_incident',
       description: 'Report a violation, failure, or anomaly to Mothership. Use when: cross-tenant data leak, PHI violation, hallucinated data, tool failure.',
       input_schema: {
@@ -333,7 +387,59 @@ var ALL_TOOLS = [
         },
         required: ['capability', 'reason']
       }
-    }];
+    },
+  { name: 'create_checkout_link', description: 'Create Stripe checkout link for product purchase (Qi Master, Qi Mini). Returns payment URL.', input_schema: { type: 'object', properties: { productId: { type: 'string', description: 'qi-master or qi-mini' }, patientName: { type: 'string', description: 'Patient name' } }, required: ['productId'] } },
+  { name: 'voice_response', description: 'Convert text to speech audio and send as Telegram voice message. Use for accessibility or when patient prefers audio.', input_schema: { type: 'object', properties: { text: { type: 'string', description: 'Text to speak (max 5000 chars)' } }, required: ['text'] } },
+];
+
+
+// ============================================================================
+// DYNAMIC TOOL DISCOVERY (v11) — boot-time fetch from Mothership
+// Falls back to hardcoded ALL_TOOLS if fetch fails. Caches to disk.
+// ============================================================================
+var HARDCODED_TOOLS = ALL_TOOLS.slice(); // preserve original
+
+async function discoverTools() {
+  try {
+    var resp = await httpsPost(MOTHERSHIP + '/api/gateway', { 'X-MCP-API-Key': MCP_KEY }, { method: 'tools/list' }, 15000);
+    if (resp && resp.tools && Array.isArray(resp.tools) && resp.tools.length > 0) {
+      var discovered = resp.tools.map(function(t) {
+        return {
+          name: t.name,
+          description: t.description || '',
+          input_schema: t.inputSchema || t.input_schema || { type: 'object', properties: {} },
+        };
+      });
+      // Merge: discovered tools + any hardcoded-only tools not in discovered set
+      var discoveredNames = new Set(discovered.map(function(t) { return t.name; }));
+      for (var i = 0; i < HARDCODED_TOOLS.length; i++) {
+        if (!discoveredNames.has(HARDCODED_TOOLS[i].name)) discovered.push(HARDCODED_TOOLS[i]);
+      }
+      ALL_TOOLS = discovered;
+      // Update scoped tool lists
+      TOOLS_COS = ALL_TOOLS;
+      TOOLS_EXPERT = ALL_TOOLS.filter(function(t) { return t.name !== 'task_mirror'; });
+      // Cache to disk
+      try { fs.writeFileSync('/tmp/nanoclaw-tools-cache.json', JSON.stringify(ALL_TOOLS, null, 2)); } catch(e) {}
+      console.log('[nc] Dynamic tools discovered: ' + ALL_TOOLS.length + ' tools from Mothership');
+      return;
+    }
+  } catch(e) {
+    console.warn('[nc] Dynamic tool discovery failed: ' + (e.message || e));
+  }
+  // Fallback: try disk cache
+  try {
+    var cached = JSON.parse(fs.readFileSync('/tmp/nanoclaw-tools-cache.json', 'utf8'));
+    if (cached && cached.length > 0) {
+      ALL_TOOLS = cached;
+      TOOLS_COS = ALL_TOOLS;
+      TOOLS_EXPERT = ALL_TOOLS.filter(function(t) { return t.name !== 'task_mirror'; });
+      console.log('[nc] Loaded ' + ALL_TOOLS.length + ' tools from cache');
+      return;
+    }
+  } catch(e) {}
+  console.log('[nc] Using ' + ALL_TOOLS.length + ' hardcoded tools (discovery + cache failed)');
+}
 
 // Scope by persona
 var TOOLS_COS = ALL_TOOLS; // Admin gets everything
@@ -345,9 +451,9 @@ function sanitize(str) {
   return str.replace(/[\x00-\x1f]/g, '').replace(/[<>]/g, '').slice(0, 500);
 }
 
-async function executeToolCall(toolName, input, tenant, correlationId) {
+async function executeToolCall(toolName, input, tenant, correlationId, chatId) {
   // SEC-06: Validate tool name against allowlist
-  var allowedTools = ['query_knowledge', 'get_patient_roster', 'create_patient', 'start_intake', 'ask_wellness_question', 'get_synthesized_capsule', 'task_mirror', 'verify_response', 'send_to_group', 'schedule_followup', 'list_scheduled_tasks', 'report_incident', 'request_capability', 'generate_speech', 'generate_video'];
+  var allowedTools = ['query_knowledge', 'get_patient_roster', 'create_patient', 'start_intake', 'ask_wellness_question', 'get_synthesized_capsule', 'task_mirror', 'verify_response', 'send_to_group', 'schedule_followup', 'list_scheduled_tasks', 'report_incident', 'request_capability', 'create_checkout_link', 'voice_response'];
   if (allowedTools.indexOf(toolName) === -1) {
     return Promise.resolve({ error: 'Tool not in allowlist: ' + toolName });
   }
@@ -396,17 +502,11 @@ async function executeToolCall(toolName, input, tenant, correlationId) {
       }, GATEWAY_TIMEOUT); // 120s — capsule runs full flywheel
 
     case 'send_to_group': {
-      // TENANT-SCOPED + CONTEXT-AWARE: Send to the group where the conversation is happening
+      // TENANT-SCOPED: Only send to THIS tenant's group (ML-175 fix)
       var groupChatId = null;
-      // If the current chat IS a group, send back to it (not a random group)
-      if (chatId < 0) {
-        groupChatId = String(chatId);
-      } else {
-        // DM context — pick the first tenant group
-        var myGroups = tenantGroups[tenant.tenantId] || [];
-        if (myGroups.length > 0) {
-          groupChatId = myGroups[0];
-        }
+      var myGroups = tenantGroups[tenant.tenantId] || [];
+      if (myGroups.length > 0) {
+        groupChatId = myGroups[0];
       }
       if (!groupChatId) {
         try {
@@ -471,20 +571,6 @@ async function executeToolCall(toolName, input, tenant, correlationId) {
       }, 15000);
 
     
-    case 'generate_speech':
-      return httpsPost(MOTHERSHIP + '/api/gateway/generate_speech', gwHeaders, {
-        text: input.text || input.message || '',
-        voice_id: input.voice_id || input.voiceId || undefined,
-      }, 30000);
-
-    case 'generate_video':
-      return httpsPost(MOTHERSHIP + '/api/gateway/generate_video', gwHeaders, {
-        prompt: input.prompt || '',
-        first_frame_image: input.first_frame_image || input.imageUrl || '',
-        duration: input.duration || 6,
-        resolution: input.resolution || '720P',
-      }, 30000);
-
     case 'report_incident':
       return httpsPost(MOTHERSHIP + '/api/gateway/report_incident', gwHeaders, {
         severity: input.severity,
@@ -503,7 +589,68 @@ async function executeToolCall(toolName, input, tenant, correlationId) {
         requestedBy: input.requestedBy || 'agent-0',
       }, 15000);
 
-default:
+    case 'create_checkout_link': {
+      var ckBody = { productId: input.productId || 'qi-master', tenantId: tenant.tenantId, expertId: tenant.expertSlug, patientName: input.patientName || '', quantity: 1, successUrl: MOTHERSHIP + '/checkout?success=true', cancelUrl: MOTHERSHIP + '/checkout?canceled=true' };
+      var ckResult = await httpsPost(MOTHERSHIP + '/api/billing/product-checkout', { 'Content-Type': 'application/json' }, ckBody);
+      if (ckResult && ckResult.checkoutUrl) return { checkoutUrl: ckResult.checkoutUrl, product: ckResult.product, total: ckResult.totalUsd };
+      return { error: 'Checkout failed', fallback: MOTHERSHIP + '/checkout' };
+    }
+
+    case 'voice_response': {
+      // T2A: Try direct MiniMax API first (per-tenant BYOK key), Mothership fallback
+      var ttsText = (input.text || '').slice(0, 5000);
+      var ttsKey = process.env.MINIMAX_TTS_API_KEY || process.env.MINIMAX_API_KEY || '';
+      var audioUrl = null;
+
+      // Path A: Direct MiniMax T2A (speech-2.8-hd, fastest)
+      if (ttsKey && ttsKey.startsWith('sk-api-')) {
+        try {
+          var t2aResult = await httpsPost('https://api.minimax.io/v1/t2a_v2', {
+            'Authorization': 'Bearer ' + ttsKey,
+            'Content-Type': 'application/json',
+          }, {
+            model: process.env.MINIMAX_TTS_MODEL || 'speech-02-hd',
+            text: ttsText,
+            voice_setting: { voice_id: input.voiceId || 'male-qn-qingse', speed: 1.0, vol: 1.0 },
+            output_format: 'url',
+          }, 15000);
+          if (t2aResult && t2aResult.base_resp && t2aResult.base_resp.status_code === 0) {
+            audioUrl = (t2aResult.data && t2aResult.data.audio) || (t2aResult.audio_file && t2aResult.audio_file.url) || null;
+          } else {
+            console.warn('[nc] Direct T2A error:', (t2aResult.base_resp || {}).status_msg || 'unknown');
+          }
+        } catch (t2aErr) {
+          console.warn('[nc] Direct T2A failed:', t2aErr.message || t2aErr);
+        }
+      }
+
+      // Path B: Mothership /api/agent/tts fallback (has per-tenant BYOK resolution)
+      if (!audioUrl) {
+        try {
+          var ttsHeaders = { 'Content-Type': 'application/json' };
+          if (process.env.CRON_SECRET) ttsHeaders['Authorization'] = 'Bearer ' + process.env.CRON_SECRET;
+          var ttsResult = await httpsPost(MOTHERSHIP + '/api/agent/tts', ttsHeaders, {
+            text: ttsText, tenantId: tenant.tenantId, voiceId: input.voiceId,
+          }, 15000);
+          if (ttsResult && ttsResult.success) audioUrl = ttsResult.audioUrl;
+        } catch (e) { console.warn('[nc] Mothership T2A fallback failed:', e.message); }
+      }
+
+      // Send voice note to Telegram
+      if (audioUrl && chatId) {
+        await tgApi('sendVoice', { chat_id: chatId, voice: audioUrl, caption: ttsText.slice(0, 100) });
+        emitAudit('tts.delivered', { chatId: chatId, tenantId: tenant.tenantId, textLength: ttsText.length });
+        return { sent: true, audioUrl: audioUrl };
+      }
+      return { error: 'Voice generation failed — no T2A key (sk-api-) or Mothership unreachable' };
+    }
+
+    default:
+      // ADAPTIVE PROXY: Any tool from Mothership SSOT dispatched via generic gateway
+      if (dynamicTools && dynamicTools.find(function(t) { return t.name === toolName; })) {
+        console.log('[nc] Dynamic tool dispatch: ' + toolName + ' → gateway');
+        return httpsPost(MOTHERSHIP + '/api/gateway/' + toolName, gwHeaders, input, 30000);
+      }
       return Promise.resolve({ error: 'Unknown tool: ' + toolName });
   }
 }
@@ -598,9 +745,118 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
 
 
 // ============================================================================
+// S4: MODEL-AGNOSTIC LLM ROUTER
+// ============================================================================
+// Supported providers: minimax, anthropic, openai, deepseek, google
+// Each provider has its own call function. callLLM() dispatches by provider name.
+// Adding a new provider: 1) write callXxx() 2) add case to callLLM() 3) add env key check
+
+var LLM_PROVIDERS = {
+  minimax:   { available: !!MINIMAX_KEY,   name: 'MiniMax M2.7' },
+  anthropic: { available: !!ANTHROPIC_KEY, name: 'Anthropic Haiku 4.5' },
+  openai:    { available: !!(process.env.OPENAI_API_KEY), name: 'OpenAI' },
+  deepseek:  { available: !!(process.env.DEEPSEEK_API_KEY), name: 'DeepSeek' },
+  google:    { available: !!(process.env.GOOGLE_AI_API_KEY), name: 'Google Gemini' },
+};
+
+/**
+ * Model-agnostic LLM call. Dispatches to provider-specific function.
+ * @param {string} provider - 'minimax' | 'anthropic' | 'openai' | 'deepseek'
+ * @param {string} systemPrompt
+ * @param {Array} messages
+ * @param {Array} tools
+ * @param {object} tenant
+ * @param {string} correlationId
+ * @returns {Promise<string|null>}
+ */
+function callLLM(provider, systemPrompt, messages, tools, tenant, correlationId, chatId) {
+  if (isGatewayCircuitOpen()) {
+    console.warn('[nc] Circuit open — skipping LLM call to ' + provider);
+    return Promise.resolve(null);
+  }
+  switch (provider) {
+    case 'minimax':   return callMiniMax(systemPrompt, messages, tools, tenant, correlationId, chatId);
+    case 'anthropic': return callAnthropic(systemPrompt, messages, tools, tenant, correlationId, chatId);
+    case 'openai':    return callOpenAI(systemPrompt, messages, tools, tenant, correlationId, chatId);
+    case 'deepseek':  return callDeepSeek(systemPrompt, messages, tools, tenant, correlationId, chatId);
+    default:
+      console.warn('[nc] Unknown LLM provider: ' + provider + ', falling back to anthropic');
+      return callAnthropic(systemPrompt, messages, tools, tenant, correlationId, chatId);
+  }
+}
+
+/**
+ * Resolve which LLM provider to use for a given query.
+ * Clinical → Anthropic (safety-proven). Admin/content → MiniMax (cheaper).
+ * Fallback chain: primary → secondary → tertiary.
+ */
+function resolveLLMProvider(text) {
+  if (isClinicalQuery(text)) {
+    // Clinical: Anthropic > MiniMax > OpenAI
+    if (LLM_PROVIDERS.anthropic.available) return 'anthropic';
+    if (LLM_PROVIDERS.minimax.available) return 'minimax';
+    if (LLM_PROVIDERS.openai.available) return 'openai';
+  } else {
+    // Admin/content: MiniMax > Anthropic > OpenAI > DeepSeek
+    if (LLM_PROVIDERS.minimax.available) return 'minimax';
+    if (LLM_PROVIDERS.anthropic.available) return 'anthropic';
+    if (LLM_PROVIDERS.openai.available) return 'openai';
+    if (LLM_PROVIDERS.deepseek.available) return 'deepseek';
+  }
+  return 'anthropic'; // last resort
+}
+
+// ============================================================================
+// OPENAI-COMPATIBLE PROVIDER (works for OpenAI, DeepSeek, and other OpenAI-API-compatible services)
+// ============================================================================
+function callOpenAICompatible(baseUrl, apiKey, model, systemPrompt, messages, tools, tenant, correlationId, chatId) {
+  var openaiTools = tools.map(function(t) {
+    return { type: 'function', function: { name: t.name, description: t.description, parameters: t.input_schema || { type: 'object', properties: {} } } };
+  });
+  var openaiMessages = [{ role: 'system', content: systemPrompt }];
+  for (var m of messages) { openaiMessages.push({ role: m.role, content: m.content }); }
+
+  function callOnce(msgs, round) {
+    return httpsPost(baseUrl, {
+      'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json',
+    }, {
+      model: model, messages: msgs,
+      tools: openaiTools.length > 0 ? openaiTools : undefined,
+      max_tokens: 4096, temperature: 0.7,
+    }, 45000).then(function(result) {
+      if (result.error) { console.error('[nc] ' + model + ' error:', JSON.stringify(result.error).slice(0, 150)); recordGatewayFailure(); return null; }
+      if (!result.choices || !result.choices[0]) { recordGatewayFailure(); return null; }
+      recordGatewaySuccess();
+      var message = result.choices[0].message;
+      if (message.tool_calls && message.tool_calls.length > 0 && round < 5) {
+        var toolPromises = message.tool_calls.map(function(tc) {
+          var input = {}; try { input = JSON.parse(tc.function.arguments); } catch(e) {}
+          return executeToolCall(tc.function.name, input, tenant, correlationId, chatId).then(function(toolResult) {
+            return { role: 'tool', tool_call_id: tc.id, content: JSON.stringify(toolResult).slice(0, 3000) };
+          });
+        });
+        return Promise.all(toolPromises).then(function(toolResults) {
+          return callOnce(msgs.concat([{ role: 'assistant', content: message.content || '', tool_calls: message.tool_calls }].concat(toolResults)), round + 1);
+        });
+      }
+      return (message.content || 'Done.').trim();
+    });
+  }
+  return callOnce(openaiMessages, 0);
+}
+
+function callOpenAI(systemPrompt, messages, tools, tenant, correlationId, chatId) {
+  return callOpenAICompatible('https://api.openai.com/v1/chat/completions', process.env.OPENAI_API_KEY || '', process.env.OPENAI_MODEL || 'gpt-4.1-mini', systemPrompt, messages, tools, tenant, correlationId, chatId);
+}
+
+function callDeepSeek(systemPrompt, messages, tools, tenant, correlationId, chatId) {
+  return callOpenAICompatible('https://api.deepseek.com/v1/chat/completions', process.env.DEEPSEEK_API_KEY || '', process.env.DEEPSEEK_MODEL || 'deepseek-chat', systemPrompt, messages, tools, tenant, correlationId, chatId);
+}
+
+// ============================================================================
 // MINIMAX M2.7 TOOL_USE (OpenAI-compatible format)
 // Used for non-clinical queries: admin tasks, scheduling, roster, group messages
-function callMiniMax(systemPrompt, messages, tools, tenant, correlationId) {
+function callMiniMax(systemPrompt, messages, tools, tenant, correlationId, chatId) {
   // Convert Anthropic tool format to OpenAI function format
   var openaiTools = tools.map(function(t) {
     return {
@@ -632,9 +888,11 @@ function callMiniMax(systemPrompt, messages, tools, tenant, correlationId) {
     }, 45000).then(function(result) {
       if (result.error) {
         console.error('[nc] MiniMax error:', JSON.stringify(result.error).slice(0, 150));
+        recordGatewayFailure();
         return null;
       }
-      if (!result.choices || !result.choices[0]) return null;
+      if (!result.choices || !result.choices[0]) { recordGatewayFailure(); return null; }
+      recordGatewaySuccess();
 
       var choice = result.choices[0];
       var message = choice.message;
@@ -645,7 +903,7 @@ function callMiniMax(systemPrompt, messages, tools, tenant, correlationId) {
           console.log('[nc] MiniMax Tool: ' + tc.function.name + '(' + tc.function.arguments.slice(0, 60) + ')');
           var input = {};
           try { input = JSON.parse(tc.function.arguments); } catch(e) {}
-          return executeToolCall(tc.function.name, input, tenant, correlationId).then(function(toolResult) {
+          return executeToolCall(tc.function.name, input, tenant, correlationId, chatId).then(function(toolResult) {
             return { role: 'tool', tool_call_id: tc.id, content: JSON.stringify(toolResult).slice(0, 3000) };
           });
         });
@@ -666,7 +924,7 @@ function callMiniMax(systemPrompt, messages, tools, tenant, correlationId) {
 
 // ANTHROPIC TOOL_USE LOOP
 // ============================================================================
-function callAnthropic(systemPrompt, messages, tools, tenant, correlationId) {
+function callAnthropic(systemPrompt, messages, tools, tenant, correlationId, chatId) {
   var totalTokens = 0;
 
   function callOnce(msgs, round) {
@@ -676,8 +934,9 @@ function callAnthropic(systemPrompt, messages, tools, tenant, correlationId) {
       model: 'claude-haiku-4-5-20251001', max_tokens: 4096,
       system: systemPrompt, messages: msgs, tools: tools,
     }, 45000).then(function(result) {
-      if (result.error) { console.error('[nc] Anthropic:', JSON.stringify(result.error).slice(0, 150)); return null; }
-      if (!result.content) return null;
+      if (result.error) { console.error('[nc] Anthropic:', JSON.stringify(result.error).slice(0, 150)); recordGatewayFailure(); return null; }
+      if (!result.content) { recordGatewayFailure(); return null; }
+      recordGatewaySuccess();
 
       var toolBlocks = result.content.filter(function(b) { return b.type === 'tool_use'; });
       var textBlocks = result.content.filter(function(b) { return b.type === 'text'; });
@@ -691,7 +950,7 @@ function callAnthropic(systemPrompt, messages, tools, tenant, correlationId) {
       // Each tool_use MUST have a matching tool_result in the next user message
       var toolPromises = toolBlocks.map(function(tb) {
         console.log('[nc] Tool: ' + tb.name + '(' + JSON.stringify(tb.input).slice(0, 60) + ')');
-        return executeToolCall(tb.name, tb.input, tenant, correlationId).then(function(toolResult) {
+        return executeToolCall(tb.name, tb.input, tenant, correlationId, chatId).then(function(toolResult) {
           return { type: 'tool_result', tool_use_id: tb.id, content: JSON.stringify(toolResult).slice(0, 3000) };
         });
       });
@@ -908,53 +1167,8 @@ async function loadAgentIdentity() {
     }
     var tgCount = Object.keys(tenantGroups).length;
     if (tgCount > 0) console.log('[nc] Tenant→group map: ' + tgCount + ' tenant(s) with groups');
-
-    // ADAPTIVE TOOLHUB: Fetch latest tool registry from Mothership at boot
-    await fetchToolRegistry().catch(function(e) {
-      console.warn('[nc] Initial toolhub fetch failed:', e.message || e);
-    });
   } catch (e) { console.warn('[nc] Identity load failed:', e.message || e); }
 }
-
-// ADAPTIVE TOOLHUB: Dynamic tool discovery from Mothership SSOT
-var dynamicTools = null;
-var toolRegistryHash = null;
-
-async function fetchToolRegistry() {
-  if (!MOTHERSHIP || !MCP_KEY) return null;
-  try {
-    var result = await httpsPost(MOTHERSHIP + '/api/gateway', {
-      'Content-Type': 'application/json',
-      'X-MCP-API-Key': MCP_KEY,
-    }, { method: 'tools/list' }, 10000);
-
-    if (result && result.result && result.result.tools) {
-      var tools = result.result.tools;
-      var meta = result.result._meta || {};
-      var newHash = meta.registryHash || '';
-
-      if (newHash && newHash !== toolRegistryHash) {
-        console.log('[nc] Tool registry updated: ' + tools.length + ' tools (hash: ' + newHash + ')');
-        toolRegistryHash = newHash;
-      }
-
-      dynamicTools = tools.map(function(t) {
-        return {
-          name: t.name,
-          description: t.description || '',
-          input_schema: t.inputSchema || { type: 'object', properties: {} },
-        };
-      });
-      console.log('[nc] Adaptive toolhub: ' + dynamicTools.length + ' tools from Mothership SSOT');
-      return dynamicTools;
-    }
-  } catch (err) {
-    console.warn('[nc] Toolhub fetch failed (using hardcoded fallback):', err.message || err);
-  }
-  return null;
-}
-
-setInterval(function() { fetchToolRegistry().catch(function() {}); }, 30 * 60 * 1000);
 
 setInterval(function() { loadAgentIdentity().catch(function() {}); }, 5 * 60 * 1000);
 
@@ -1111,9 +1325,9 @@ async function handleMessage(msg) {
   var text = msg.text || msg.caption || '';
 
   // Hard gate: ignore commands addressed to other bots (G-11)
-  if (text && text.includes('@') && !text.includes('@LongevityValley_Bot')) {
+  if (text && text.includes('@') && !text.includes('@' + BOT_USERNAME)) {
     var botCommandMatch = text.match(/@(\w+)/);
-    if (botCommandMatch && botCommandMatch[1] !== 'LongevityValley_Bot') {
+    if (botCommandMatch && botCommandMatch[1] !== BOT_USERNAME) {
       console.log('[nc] Ignoring command for other bot: @' + botCommandMatch[1]);
       return;
     }
@@ -1280,7 +1494,7 @@ async function handleMessage(msg) {
     var mentionsPatient = false; for (var pid in patientNameCache) { var fn = patientNameCache[pid].split(" ")[0].toLowerCase(); if (fn.length > 2 && text.toLowerCase().includes(fn)) { mentionsPatient = true; break; } }
     if (phiPatterns.test(text) && (mentionsPatient || (entityId && entityId.startsWith("patient:")))) {
       console.log('[nc] SEC-PHI-GROUP: Blocked PHI query in group for ' + entityId);
-      await sendTelegram(chatId, 'For patient privacy, I cannot discuss individual health details in the group chat. Please send me a direct message for this — tap @LongevityValley_Bot and hit Start.');
+      await sendTelegram(chatId, 'For patient privacy, I cannot discuss individual health details in the group chat. Please send me a direct message for this — tap @' + BOT_USERNAME + ' and hit Start.');
       emitAudit('nanoclaw.phi_guard', { chatId: chatId, entity: entityId, action: 'blocked_group_phi', correlationId: correlationId });
       return;
     }
@@ -1309,7 +1523,7 @@ async function handleMessage(msg) {
       reply += '- Completed (7d): ' + (stats.completed_7d || 0) + '\n';
       reply += '- Identity: ' + (status.identity || '?') + '\n';
       if (mirror.actions && mirror.actions.length > 0) reply += '- Actions: ' + mirror.actions.join(', ') + '\n';
-      reply += '- NanoClaw: v10-ESAGM, entities=' + Object.keys(getChat(chatId).entities).length + ', msgs=' + msgCount;
+      reply += '- NanoClaw: ' + NANOCLAW_VERSION + '-ESAGM, entities=' + Object.keys(getChat(chatId).entities).length + ', msgs=' + msgCount;
       reply = cleanResponse(reply);
     await sendTelegram(chatId, reply);
       persistConversationData(chatId, entityId, text, response, tenant);
@@ -1368,22 +1582,23 @@ async function handleMessage(msg) {
   try {
     var response;
 
-    if (MINIMAX_KEY && !isClinicalQuery(text)) {
-      // NON-CLINICAL: MiniMax M2.7 (76% cheaper, admin/scheduling/roster)
-      response = await callMiniMax(systemPrompt, contextMessages, tools, tenant, correlationId);
-      if (!response && ANTHROPIC_KEY) {
-        // MiniMax failed — fallback to Anthropic
-        console.warn('[nc] MiniMax failed, falling back to Anthropic');
-        response = await callAnthropic(systemPrompt, contextMessages, tools, tenant, correlationId);
+    // S4: Model-agnostic LLM routing via resolveLLMProvider()
+    var primaryProvider = resolveLLMProvider(text);
+    response = await callLLM(primaryProvider, systemPrompt, contextMessages, tools, tenant, correlationId, chatId);
+
+    // Fallback chain: if primary fails, try next available provider
+    if (!response) {
+      var fallbacks = ['anthropic', 'minimax', 'openai', 'deepseek'].filter(function(p) {
+        return p !== primaryProvider && LLM_PROVIDERS[p] && LLM_PROVIDERS[p].available;
+      });
+      for (var fi = 0; fi < fallbacks.length && !response; fi++) {
+        console.warn('[nc] ' + primaryProvider + ' failed, trying ' + fallbacks[fi]);
+        response = await callLLM(fallbacks[fi], systemPrompt, contextMessages, tools, tenant, correlationId, chatId);
       }
-    } else if (ANTHROPIC_KEY) {
-      // CLINICAL: Anthropic Haiku (proven safety for health queries)
-      response = await callAnthropic(systemPrompt, contextMessages, tools, tenant, correlationId);
-    } else if (MINIMAX_KEY) {
-      // No Anthropic key — MiniMax for everything
-      response = await callMiniMax(systemPrompt, contextMessages, tools, tenant, correlationId);
-    } else {
-      // No LLM keys — gateway fallback
+    }
+
+    // Last resort: gateway text-only
+    if (!response) {
       response = await callGateway(text, tenant.tenantId, tenant.expertSlug);
     }
 
@@ -1485,21 +1700,24 @@ http.createServer(function(req, res) {
   }
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
-    status: 'ok', agent: 'nanoclaw-v10-esagm', messages: msgCount,
+    status: 'ok', agent: 'nanoclaw-v11-esagm', messages: msgCount,
     uptime: Math.round(process.uptime()),
     memory: { type: 'ESAGM', entities: Object.keys(entities).length }, // SEC-07: no patient names in health
     capabilities: ANTHROPIC_KEY ? 'tool_use+esagm' : 'gateway_only',
   }));
 }).listen(HEALTH_PORT, '127.0.0.1'); // SEC-07: localhost only
+healthServer = this; // S2: reference for graceful shutdown
 
-console.log('[nc] NanoClaw v10 ESAGM on :' + HEALTH_PORT);
+console.log('[nc] NanoClaw ' + NANOCLAW_VERSION + ' ESAGM on :' + HEALTH_PORT);
 console.log('[nc] Persona: COS (admin) + Expert Rep (Keith Koo)');
 console.log('[nc] Memory: Entity-Scoped Attention Graph (per-patient isolation)');
 console.log('[nc] Tools: ' + (ANTHROPIC_KEY ? 'Anthropic tool_use (scoped by persona)' : 'Gateway only (no ANTHROPIC_KEY)'));
 console.log('[nc] Audit: agent_event_bus + correlation IDs');
+console.log('[nc] Version: ' + NANOCLAW_VERSION + ' | Tools: ' + ALL_TOOLS.length);
 loadAgentIdentity().catch(function(e) { console.warn('[nc] Initial identity load failed:', e.message); });
+discoverTools().catch(function(e) { console.warn('[nc] Tool discovery failed:', e.message); });
 
 // Startup audit event
-emitAudit('nanoclaw.startup', { version: 'v10-esagm', capabilities: ANTHROPIC_KEY ? 'full' : 'gateway_only' });
+emitAudit('nanoclaw.startup', { version: NANOCLAW_VERSION, capabilities: ANTHROPIC_KEY ? 'full' : 'gateway_only' });
 
 poll();
