@@ -519,6 +519,18 @@ function resolveEntity(text, chat, tenant) {
     if (lower.includes(pname)) return knownPatients2[pname];
   }
 
+  // 3c. Dynamic patient resolution from patientNameCache (covers ALL registered patients)
+  for (var _pid in patientNameCache) {
+    var _pname = patientNameCache[_pid].toLowerCase();
+    var _parts = _pname.split(/[\s()]+/).filter(function(p) { return p.length >= 3; });
+    for (var _pp = 0; _pp < _parts.length; _pp++) {
+      if (_parts[_pp].length >= 4 && lower.includes(_parts[_pp])) {
+        var _slug = _pname.replace(/[\s()]+/g, '-').replace(/[^a-z0-9-]/g, '');
+        return 'patient:' + _slug;
+      }
+    }
+  }
+
   // 4. Pronoun resolution → most recent patient (with gender matching)
   if (/\b(her|his|she|he|the patient|this patient|for her|for him)\b/i.test(lower)) {
     var isFemale = /\b(her|she)\b/i.test(lower);
@@ -1647,12 +1659,14 @@ async function handleMessage(msg) {
   var _chatGlobal = getChat(chatId).global || {};
   var _recentMedia = _chatGlobal.lastMediaAnalysis;
   var _mediaContext = '';
-  if (_recentMedia && (Date.now() - _recentMedia.timestamp) < 10 * 60 * 1000) {
+  if (_recentMedia && (Date.now() - _recentMedia.timestamp) < 30 * 60 * 1000) {
     // Extract patient name from the analysis
     var _analysisPatient = (_recentMedia.content.match(/Patient.*?:\s*([A-Z][A-Z\s]+)/i) || [])[1] || '';
     // Check if the user's message references the SAME patient OR uses generic reference
     var _textLower = text.toLowerCase();
-    var _patientMatch = _analysisPatient && _textLower.includes(_analysisPatient.toLowerCase().split(' ')[0]);
+    var _apLower = _analysisPatient ? _analysisPatient.toLowerCase() : '';
+    var _apParts = _apLower.split(/\s+/).filter(function(p) { return p.length >= 3; });
+    var _patientMatch = _apParts.some(function(p) { return _textLower.includes(p); });
     var _genericRef = /\b(the report|this report|that report|the analysis|blood test|lab report|her report|his report)\b/i.test(text);
     // ONLY inject if patient matches OR user explicitly references "the report"
     if (_patientMatch || _genericRef) {
