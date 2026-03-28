@@ -211,6 +211,7 @@ function getEntity(chatId, entityId) {
       turns: [],
       digest: '',
       anchor: '',
+      pendingIntents: [],  // Multi-turn intent tracking for conversation completeness
     };
   }
   return chat.entities[entityId];
@@ -732,6 +733,15 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
   }
 
   // BEHAVIORAL RULES (6 core — ML-172: hard gates handle safety, not prompt rules)
+    // MULTI-TURN INTENT TRACKING
+  if (entity.pendingIntents && entity.pendingIntents.length > 0) {
+    sys += "PENDING INTENTS (from earlier in this conversation — you MUST address these):\n";
+    for (var pi = 0; pi < entity.pendingIntents.length; pi++) {
+      sys += "- " + entity.pendingIntents[pi] + "\n";
+    }
+    sys += "After answering the current message, check these pending items and report status.\n\n";
+  }
+
   sys += "Rules:\n";
   sys += "- Be warm, curious, conversational. Companion, not form.\n";
   sys += "- Execute admin tasks immediately using tools. Look up patient data yourself — never ask admin what the KB already knows.\n";
@@ -1640,6 +1650,43 @@ async function handleMessage(msg) {
     }
     await sendTelegram(chatId, response);
     console.log('[nc] Delivered (' + response.length + ' chars) entity=' + entityId);
+
+    // MULTI-TURN INTENT TRACKING: Extract unfulfilled intents from user message
+    // Detect multi-part requests (commas, "and", numbered lists)
+    var userMsg = text || '';
+    var intentMarkers = userMsg.match(/(?:^|,|\band\b|\d+[.)]) *([A-Z][^,.]+)/g);
+    if (intentMarkers && intentMarkers.length > 1) {
+      // User asked for multiple things — track as pending
+      var fulfilled = [];
+      var pending = [];
+      for (var im = 0; im < intentMarkers.length; im++) {
+        var intent = intentMarkers[im].replace(/^[,\d.)]+\s*/, '').trim();
+        if (intent.length > 5) {
+          // Check if response addresses this intent (simple keyword match)
+          var intentWords = intent.toLowerCase().split(/\s+/).slice(0, 3);
+          var addressed = intentWords.some(function(w) { return response.toLowerCase().includes(w); });
+          if (addressed) { fulfilled.push(intent); } else { pending.push(intent); }
+        }
+      }
+      if (pending.length > 0) {
+        var ent = getEntity(chatId, entityId);
+        ent.pendingIntents = pending.slice(0, 5); // cap at 5 pending
+        console.log('[nc] Pending intents: ' + pending.join(', '));
+      } else {
+        getEntity(chatId, entityId).pendingIntents = []; // all fulfilled
+      }
+    }
+
+    // PROACTIVE LOOP: If there are pending intents and response didn't mention them,
+    // append a reminder (but only if response doesn't already reference pending items)
+    var ent2 = getEntity(chatId, entityId);
+    if (ent2.pendingIntents && ent2.pendingIntents.length > 0 && !response.includes('pending') && !response.includes('still need to')) {
+      var reminder = '\n\n📋 Still pending from earlier: ' + ent2.pendingIntents.join(', ') + '. Want me to proceed with these?';
+      if (response.length + reminder.length < 4000) {
+        await sendTelegram(chatId, reminder);
+        console.log('[nc] Proactive reminder sent: ' + ent2.pendingIntents.length + ' pending intents');
+      }
+    }
 
     // 9. Audit: response delivered (G1)
     persistConversationData(chatId, entityId, text, response, tenant);
