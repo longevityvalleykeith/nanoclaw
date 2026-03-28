@@ -1640,8 +1640,18 @@ async function handleMessage(msg) {
     }).join('\n');
     systemPrompt += '\n\nConversation history for this entity:\n' + historyText;
   }
+  // Wire 4: If recent media analysis exists and user references it, inject into context
+  var _chatGlobal = getChat(chatId).global || {};
+  var _recentMedia = _chatGlobal.lastMediaAnalysis;
+  var _mediaContext = '';
+  if (_recentMedia && (Date.now() - _recentMedia.timestamp) < 5 * 60 * 1000) {
+    if (/\b(this|that|it|these|those|above|report|document|image|photo|analyse|analyze|verify|check|re.?analy)\b/i.test(text)) {
+      _mediaContext = '[Previous analysis (' + _recentMedia.fileName + '):\n' + _recentMedia.content.slice(0, 1500) + ']\n\nUser request: ';
+      console.log('[nc] Wire 4: injected media context (' + _recentMedia.content.length + ' chars) into LLM context');
+    }
+  }
   // ONLY the current user message goes in messages array — clean for tool_use
-  var contextMessages = [{ role: 'user', content: text }];
+  var contextMessages = [{ role: 'user', content: _mediaContext + text }];
 
   try {
     var response;
@@ -1682,6 +1692,13 @@ async function handleMessage(msg) {
     await sendTelegram(chatId, response);
     console.log('[nc] Delivered (' + response.length + ' chars) entity=' + entityId);
 
+      // Wire 2: Typed patient events for entity graph sync
+      if (toolName === 'create_patient' && toolResult && !toolResult.error) {
+        emitAudit('patient.registered', { patient_id: toolResult.patientId || null, tool: toolName, correlationId: correlationId, tenantId: tenant.tenantId });
+      }
+      if (toolName === 'ask_wellness_question' && toolResult && !toolResult.error) {
+        emitAudit('patient.clinical_verified', { tool: toolName, correlationId: correlationId, tenantId: tenant.tenantId });
+      }
       // HACPO experience report (non-blocking)
       emitAudit('agent.experience.report', {
         tenantId: tenant.tenantId, chatId: chatId, entityId: entityId,
