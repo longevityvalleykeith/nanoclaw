@@ -1488,10 +1488,13 @@ async function handleMessage(msg) {
         // CRITICAL: Store in chat-level shared context so ALL entities can see it
         var chatObj = getChat(chatId);
         chatObj.global = chatObj.global || {};
+        // Extract patient name from Gemini analysis for Wire 4 patient matching
+        var _patientNameMatch = geminiText.match(/(?:Patient|Name).*?:\s*([A-Z][A-Za-z\s]+?)(?:\n|,|\()/);
         chatObj.global.lastMediaAnalysis = {
           content: geminiText.slice(0, 3000),
           mediaType: mediaType,
           fileName: (msg.document && msg.document.file_name) || 'uploaded_file',
+          patientName: _patientNameMatch ? _patientNameMatch[1].trim() : null,
           timestamp: Date.now(),
         };
         console.log('[nc] Media analysis stored in chat global context (' + geminiText.length + ' chars retained)');
@@ -1640,14 +1643,25 @@ async function handleMessage(msg) {
     }).join('\n');
     systemPrompt += '\n\nConversation history for this entity:\n' + historyText;
   }
-  // Wire 4: If recent media analysis exists and user references it, inject into context
+  // Wire 4: Patient-aware media context bridge (SAFETY: must match patient being discussed)
   var _chatGlobal = getChat(chatId).global || {};
   var _recentMedia = _chatGlobal.lastMediaAnalysis;
   var _mediaContext = '';
-  if (_recentMedia && (Date.now() - _recentMedia.timestamp) < 5 * 60 * 1000) {
-    if (/\b(this|that|it|these|those|above|report|document|image|photo|analyse|analyze|verify|check|re.?analy)\b/i.test(text)) {
-      _mediaContext = '[Previous analysis (' + _recentMedia.fileName + '):\n' + _recentMedia.content.slice(0, 1500) + ']\n\nUser request: ';
-      console.log('[nc] Wire 4: injected media context (' + _recentMedia.content.length + ' chars) into LLM context');
+  if (_recentMedia && (Date.now() - _recentMedia.timestamp) < 10 * 60 * 1000) {
+    // Extract patient name from the analysis
+    var _analysisPatient = (_recentMedia.content.match(/Patient.*?:\s*([A-Z][A-Z\s]+)/i) || [])[1] || '';
+    // Check if the user's message references the SAME patient OR uses generic reference
+    var _textLower = text.toLowerCase();
+    var _patientMatch = _analysisPatient && _textLower.includes(_analysisPatient.toLowerCase().split(' ')[0]);
+    var _genericRef = /\b(the report|this report|that report|the analysis|blood test|lab report|her report|his report)\b/i.test(text);
+    // ONLY inject if patient matches OR user explicitly references "the report"
+    if (_patientMatch || _genericRef) {
+      _mediaContext = '[Lab report for ' + (_analysisPatient || 'unknown patient') + ':\n' + _recentMedia.content.slice(0, 1500) + ']\n\nIMPORTANT: This data belongs to ' + (_analysisPatient || 'the patient above') + '. Do NOT apply it to a different patient.\n\nUser request: ';
+      console.log('[nc] Wire 4: injected media for patient ' + _analysisPatient + ' (' + _recentMedia.content.length + ' chars)');
+    } else if (/\b(verify|check|analyse|analyze|safe|prescription|re.?analy)\b/i.test(text)) {
+      // User asking clinical question but patient might not match — warn
+      _mediaContext = '[NOTE: The last analyzed report was for ' + (_analysisPatient || 'a different patient') + '. Make sure you are answering about the CORRECT patient the user is asking about. If unsure, ASK which patient they mean.]\n\nUser request: ';
+      console.log('[nc] Wire 4: patient mismatch warning injected');
     }
   }
   // ONLY the current user message goes in messages array — clean for tool_use
@@ -1718,7 +1732,15 @@ async function handleMessage(msg) {
   } catch (e) {
     clearInterval(typingInterval);
     console.error('[nc] Error:', e.message);
-    await sendTelegram(chatId, 'Processing error. Please try again.').catch(function() {});
+    // B-1 FIX: Log error + emit audit (previously swallowed)
+    var errMsg = error instanceof Error ? error.message : String(error);
+    console.error('[nc] RESPONSE ERROR for chatId=' + chatId + ': ' + errMsg);
+    emitAudit('agent.error', {
+      chatId: chatId, error: errMsg.slice(0, 200),
+      entityId: entityId, persona: persona,
+      correlationId: correlationId, tenantId: tenant.tenantId,
+    });
+    await sendTelegram(chatId, 'Processing error: ' + (errMsg.includes('429') ? 'Rate limited — retrying shortly.' : 'Please try again.')).catch(function() {});
   }
 }
 
