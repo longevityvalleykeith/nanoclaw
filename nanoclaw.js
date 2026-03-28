@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * NanoClaw v11 — Entity-Scoped Attention Graph Memory (ESAGM)
+ * NanoClaw v10 — Entity-Scoped Attention Graph Memory (ESAGM)
  *
  * Agent 0 Chief of Staff: autonomous dual-persona (COS + Expert Rep)
  * with entity-isolated multi-turn memory, hierarchy-scoped tool access,
@@ -18,35 +18,17 @@
 const https = require('https');
 const http = require('http');
 const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
-
-const NANOCLAW_VERSION = 'v11.2.0'; // S1-S4 + T2A direct voice, chatId passthrough, 5-provider LLM router
-const TENANT_MODE = process.env.TENANT_MODE || 'multi';
-const BOT_USERNAME = process.env.BOT_USERNAME || 'LongevityValley_Bot';
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const MOTHERSHIP = process.env.LV_BACKEND_URL || 'https://app.longevityvalley.ai';
 const MCP_KEY = process.env.MCP_API_KEY;
-
-// Per-tenant MCP key map (prevents cross-tenant data leak)
-var TENANT_MCP_KEYS = {};
-if (TENANT_MODE === 'multi') {
-  TENANT_MCP_KEYS = {
-    'abe1b946-6643-4acc-9cc1-6a47336d31d8': process.env.MCP_API_KEY_AMANI || MCP_KEY,   // Amani Wellness
-    '3cc281be-aafc-4579-9edf-521659306145': process.env.MCP_API_KEY_MAGFIELD || MCP_KEY,  // DR MAGfield
-    '313a6002-5718-4c28-8fe1-82f831b83cdf': MCP_KEY,                                      // Keith LV (default)
-  };
-}
-function getMcpKey(tenantId) {
-  if (TENANT_MODE === 'single') return MCP_KEY;
-  return TENANT_MCP_KEYS[tenantId] || MCP_KEY;
-}
 if (!MCP_KEY) { console.error('[nc] FATAL: MCP_API_KEY not set'); process.exit(1); }
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
 const MINIMAX_KEY = process.env.MINIMAX_API_KEY || '';
+const MINIMAX_TTS_KEY = process.env.MINIMAX_TTS_API_KEY || process.env.MINIMAX_API_KEY || '';
 const MINIMAX_URL = 'https://api.minimax.io/v1/chat/completions';
 const MINIMAX_MODEL = 'MiniMax-M2.7';
+const MINIMAX_GROUP_ID = process.env.MINIMAX_GROUP_ID || '';
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const CRON_SECRET = process.env.CRON_SECRET || '';
@@ -58,58 +40,6 @@ const HEALTH_PORT = 3002;
 const GATEWAY_TIMEOUT = 120000;
 
 if (!TG_TOKEN) { console.error('[nc] FATAL: TELEGRAM_BOT_TOKEN not set'); process.exit(1); }
-
-// ============================================================================
-// S1: PROCESS CRASH RECOVERY
-// ============================================================================
-process.on('uncaughtException', function(err) {
-  console.error('[nc] UNCAUGHT EXCEPTION:', err.message, err.stack);
-  emitAudit('nanoclaw.crash', { type: 'uncaughtException', error: err.message });
-  // Give audit time to flush, then exit with error code
-  setTimeout(function() { process.exit(1); }, 2000);
-});
-process.on('unhandledRejection', function(reason) {
-  console.error('[nc] UNHANDLED REJECTION:', reason);
-  emitAudit('nanoclaw.crash', { type: 'unhandledRejection', error: String(reason) });
-});
-
-// ============================================================================
-// S2: GRACEFUL SHUTDOWN
-// ============================================================================
-var healthServer = null; // assigned later at startup
-var isShuttingDown = false;
-function gracefulShutdown(signal) {
-  if (isShuttingDown) return;
-  isShuttingDown = true;
-  console.log('[nc] ' + signal + ' received — graceful shutdown');
-  emitAudit('nanoclaw.shutdown', { signal: signal, version: NANOCLAW_VERSION });
-  if (healthServer) try { healthServer.close(); } catch(e) {}
-  setTimeout(function() { process.exit(0); }, 3000);
-}
-process.on('SIGTERM', function() { gracefulShutdown('SIGTERM'); });
-process.on('SIGINT', function() { gracefulShutdown('SIGINT'); });
-
-// ============================================================================
-// S3: CIRCUIT BREAKER ON MOTHERSHIP GATEWAY
-// ============================================================================
-var gatewayFailures = 0;
-var gatewayCircuitOpenUntil = 0;
-var GATEWAY_CB_THRESHOLD = 5;
-var GATEWAY_CB_COOLDOWN_MS = 60000; // 1 minute
-function isGatewayCircuitOpen() {
-  return Date.now() < gatewayCircuitOpenUntil;
-}
-function recordGatewaySuccess() {
-  gatewayFailures = 0;
-}
-function recordGatewayFailure() {
-  gatewayFailures++;
-  if (gatewayFailures >= GATEWAY_CB_THRESHOLD) {
-    gatewayCircuitOpenUntil = Date.now() + GATEWAY_CB_COOLDOWN_MS;
-    console.warn('[nc] Circuit breaker OPEN on Mothership gateway after ' + gatewayFailures + ' failures');
-    emitAudit('nanoclaw.circuit_open', { failures: gatewayFailures, cooldownMs: GATEWAY_CB_COOLDOWN_MS });
-  }
-}
 
 // ============================================================================
 // TENANT MAPPING
@@ -166,16 +96,6 @@ function tgApi(method, body) {
   return httpsPost('https://api.telegram.org/bot' + TG_TOKEN + '/' + method, {}, body || {}, (POLL_TIMEOUT + 10) * 1000);
 }
 
-// Strip <think>...</think> tags and clean LLM artifacts from response
-function cleanResponse(text) {
-  if (!text) return text;
-  // Remove <think>...</think> blocks (including multiline)
-  text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-  // Remove any remaining orphaned think tags
-  text = text.replace(/<\/?think>/gi, '').trim();
-  return text || 'I understand. How can I help?';
-}
-
 function sendTelegram(chatId, text) {
   var clean = text.replace(/<think>[^]*?<\/think>/g, '').replace(/<\/?think>/g, '').replace(/<!-- .*? -->/g, '').trim();
   if (!clean) clean = 'How can I help?';
@@ -183,6 +103,341 @@ function sendTelegram(chatId, text) {
   return tgApi('sendMessage', { chat_id: chatId, text: truncated, parse_mode: 'Markdown' })
     .catch(function() { return tgApi('sendMessage', { chat_id: chatId, text: truncated }); });
 }
+
+// ============================================================================
+// GEO RELAY — DR MAGfield Autonomous Loop
+// ============================================================================
+// Auto-relays GEO research outputs to Keith. Triggered after content generation.
+// Chat ID for Keith: 1544430803
+
+var GEO_ADMIN_CHAT_ID = '1544430803';
+var GEO_GROUP_CHAT_ID = '-3771302334'; // Supergroup
+
+// Geo feedback storage: pattern → count
+var geoFeedbackPattern = {};
+
+// Token budget tracking
+var geoTokenBudget = {
+  total: 150000,
+  remaining: 80000,  // Updated after first cycle spend estimate
+  cycleStart: Date.now()
+};
+
+// ============================================================================
+// USER PREFERENCE TRACKER — Multi-modal response preferences
+// ============================================================================
+// Stores per-chat preference for response format: voice, video, or text
+var userPreferences = {};
+
+function getUserPreference(chatId) {
+  var prefs = userPreferences[String(chatId)] || { format: 'text', voiceId: null, learnedAt: null };
+  return prefs;
+}
+
+function setUserPreference(chatId, format, voiceId) {
+  var key = String(chatId);
+  if (!userPreferences[key]) userPreferences[key] = { format: 'text', voiceId: null, learnedAt: null };
+  userPreferences[key].format = format;
+  if (voiceId) userPreferences[key].voiceId = voiceId;
+  userPreferences[key].learnedAt = Date.now();
+  console.log('[nc] User ' + chatId + ' preference set: format=' + format + (voiceId ? ' voiceId=' + voiceId : ''));
+}
+
+function parseResponsePreference(text) {
+  var lower = text.toLowerCase();
+  if (/send (as |as )?(voice|audio|voicenote|vocal)/i.test(text)) return 'voice';
+  if (/make a (video|i2v)|generate video|create video/i.test(text)) return 'video';
+  if (/send as text|text (only|reply)|文字|text reply/i.test(text)) return 'text';
+  return null;
+}
+
+// ============================================================================
+// MULTI-MODAL HELPERS — MiniMax TTS + I2V
+// ============================================================================
+
+// Upload file to catbox for public URL (used for I2V first_frame_image)
+function uploadToCatbox(fileBuffer, filename, mimeType) {
+  return new Promise(function(resolve, reject) {
+    var boundary = '----FormBoundary' + Date.now();
+    var body = '--' + boundary + '\r\n';
+    body += 'Content-Disposition: form-data; name="reqtype"\r\n\r\n';
+    body += 'fileupload\r\n';
+    body += '--' + boundary + '\r\n';
+    body += 'Content-Disposition: form-data; name="fileToUpload"; filename="' + filename + '"\r\n';
+    body += 'Content-Type: ' + mimeType + '\r\n\r\n';
+
+    var buf = Buffer.concat([
+      Buffer.from(body, 'utf8'),
+      fileBuffer,
+      Buffer.from('\r\n--' + boundary + '--\r\n', 'utf8')
+    ]);
+
+    var u = new URL('https://catbox.moe/user/api.php');
+    var req = https.request({
+      method: 'POST', hostname: u.hostname, port: 443,
+      path: u.pathname, family: 4,
+      headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Content-Length': buf.length }
+    }, function(res) {
+      var chunks = [];
+      res.on('data', function(c) { chunks.push(c); });
+      res.on('end', function() {
+        var result = Buffer.concat(chunks).toString('utf8');
+        if (result.startsWith('https://')) resolve(result.trim());
+        else reject(new Error('Catbox upload failed: ' + result));
+      });
+    });
+    req.on('error', reject);
+    req.write(buf);
+    req.end();
+  });
+}
+
+// Generate TTS audio via MiniMax
+function generateTTS(text, voiceId, speed) {
+  voiceId = voiceId || 'male-qn-qingse';
+  speed = speed || 1.0;
+  return httpsPost('https://api.minimax.io/v1/t2a_v2', {
+    'Authorization': 'Bearer ' + MINIMAX_TTS_KEY,
+    'Content-Type': 'application/json',
+  }, {
+    model: 'speech-02-hd',
+    text: text.slice(0, 5000),
+    voice_setting: { voice_id: voiceId, speed: speed, vol: 1.0 },
+    output_format: 'url'
+  }, 30000).then(function(result) {
+    if (result.base_resp && result.base_resp.status_code !== 0) {
+      throw new Error('TTS failed: ' + (result.base_resp.status_msg || 'unknown'));
+    }
+    var audioUrl = result.data && result.data.audio ? result.data.audio : null;
+    return { success: !!audioUrl, audioUrl: audioUrl, extra: result.extra_info || {} };
+  });
+}
+
+// Generate I2V via MiniMax (image to video)
+function generateI2V(imageUrl, prompt, duration) {
+  duration = duration || 6;
+  var model = 'MiniMax-Hailuo-2.3';
+  return httpsPost('https://api.minimax.io/v1/video_generation', {
+    'Authorization': 'Bearer ' + MINIMAX_KEY,
+  }, {
+    model: model,
+    first_frame_image: imageUrl,
+    prompt: (prompt || '').slice(0, 2000),
+    duration: duration,
+  }, 15000).then(function(result) {
+    if (result.base_resp && result.base_resp.status_code !== 0) {
+      throw new Error('I2V failed: ' + (result.base_resp.status_msg || 'unknown'));
+    }
+    return { success: !!result.task_id, taskId: result.task_id };
+  });
+}
+
+// Poll I2V status until done
+function pollI2V(taskId, maxAttempts) {
+  maxAttempts = maxAttempts || 18;
+  return new Promise(function(resolve, reject) {
+    var attempts = 0;
+    function poll() {
+      attempts++;
+      httpsGet('https://api.minimax.io/v1/query/video_generation?task_id=' + taskId, {
+        'Authorization': 'Bearer ' + MINIMAX_KEY,
+      }, 10000).then(function(result) {
+        if (result.status === 'Success') {
+          resolve({ success: true, fileId: result.file_id, width: result.video_width, height: result.video_height });
+        } else if (result.status === 'Fail') {
+          reject(new Error('I2V generation failed'));
+        } else if (attempts >= maxAttempts) {
+          reject(new Error('I2V timeout after ' + maxAttempts + ' attempts'));
+        } else {
+          setTimeout(poll, 10000);
+        }
+      }).catch(reject);
+    }
+    poll();
+  });
+}
+
+// Voice clone via MiniMax (requires sk-api- key with voice clone enabled)
+function cloneVoice(audioBuffer, name, description) {
+  var boundary = '----FormBoundary' + Date.now();
+  var body = '--' + boundary + '\r\n';
+  body += 'Content-Disposition: form-data; name="name"\r\n\r\n';
+  body += (name || 'cloned_voice') + '\r\n';
+  body += '--' + boundary + '\r\n';
+  body += 'Content-Disposition: form-data; name="description"\r\n\r\n';
+  body += (description || 'cloned voice') + '\r\n';
+  body += '--' + boundary + '\r\n';
+  body += 'Content-Disposition: form-data; name="audio"; filename="voice.ogg"\r\n';
+  body += 'Content-Type: audio/ogg\r\n\r\n';
+
+  var buf = Buffer.concat([
+    Buffer.from(body, 'utf8'),
+    audioBuffer,
+    Buffer.from('\r\n--' + boundary + '--\r\n', 'utf8')
+  ]);
+
+  return new Promise(function(resolve, reject) {
+    var u = new URL('https://api.minimax.io/v1/voice_clone');
+    var req = https.request({
+      method: 'POST', hostname: u.hostname, port: 443,
+      path: u.pathname, family: 4,
+      headers: { 'Authorization': 'Bearer ' + MINIMAX_TTS_KEY, 'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Content-Length': buf.length }
+    }, function(res) {
+      var chunks = [];
+      res.on('data', function(c) { chunks.push(c); });
+      res.on('end', function() {
+        try {
+          var result = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          if (result.base_resp && result.base_resp.status_code !== 0) {
+            reject(new Error('Voice clone failed: ' + (result.base_resp.status_msg || 'unknown')));
+          } else {
+            resolve({ success: !!result.voice_id, voiceId: result.voice_id });
+          }
+        } catch(e) {
+          reject(e);
+        }
+      });
+    });
+    req.on('error', reject);
+    req.write(buf);
+    req.end();
+  });
+}
+
+// Send Telegram voice message
+function sendVoiceMessage(chatId, audioUrl, caption) {
+  return tgApi('sendVoice', {
+    chat_id: chatId,
+    voice: audioUrl,
+    caption: caption ? caption.slice(0, 200) : undefined,
+  });
+}
+
+// ============================================================================
+// BRAND DNA — Multi-modal aware system prompt builder
+// ============================================================================
+function buildMultimodalSystemPrompt(tenant, persona, chatId) {
+  var brand = BRAND_DNA;
+  var pref = getUserPreference(chatId);
+  var prompt = 'You are ' + brand.name + ' — ' + brand.tagline + '.\n';
+  prompt += 'Tech: ' + brand.tech + '.\n';
+  prompt += 'Products: ' + brand.products.join(', ') + '.\n';
+  prompt += 'Location: ' + brand.location + '.\n';
+  prompt += 'Tone: ' + brand.tone + '.\n';
+  prompt += 'ICP: ' + brand.icp + '.\n\n';
+
+  if (pref.format === 'voice' && pref.voiceId) {
+    prompt += 'USER PREFERENCE: Respond with voice (TTS). Use voice_id: ' + pref.voiceId + '.\n';
+  } else if (pref.format === 'video') {
+    prompt += 'USER PREFERENCE: Generate I2V video responses when appropriate.\n';
+  }
+
+  prompt += '\nREMEMBER: You have multi-modal capabilities:\n';
+  prompt += '- voice_response: Send as Telegram voice message\n';
+  prompt += '- generate_tts: Create TTS audio with specific voice\n';
+  prompt += '- generate_i2v: Create video from image + prompt\n';
+  prompt += '- When user asks for "voice" or "audio" — use voice_response tool\n';
+  prompt += '- When user asks for "video" or "I2V" — use generate_i2v tool\n';
+  prompt += '- Detect preference from: "send as voice", "make a video", "text reply"\n';
+  return prompt;
+}
+
+function relayGeoOutput(type, summary, details) {
+  var msg = buildGeoMessage(type, summary, details);
+  sendTelegram(GEO_ADMIN_CHAT_ID, msg).catch(function(e) {
+    console.error('[nc] GEO relay failed:', e.message || e);
+  });
+  // Group gets emoji-only summary
+  if (type === 'iteration_complete' || type === 'published') {
+    var emoji = type === 'published' ? '🎉' : '📊';
+    sendTelegram(GEO_GROUP_CHAT_ID, emoji + ' ' + summary.slice(0, 100)).catch(function() {});
+  }
+}
+
+function buildGeoMessage(type, summary, details) {
+  var header = {
+    'fix_pack': '📋 GEO Fix Pack',
+    'content_published': '🚀 Content Published',
+    'citation_recheck': '📊 Citation Recheck',
+    'iteration_complete': '📊 Iteration Done',
+    'alert': '⚠️ Alert',
+    'digest': '☀️ Daily Digest'
+  }[type] || '📋 Update';
+
+  var msg = header + ' — ' + formatDate() + '\n\n' + summary;
+  if (details) msg += '\n\n' + details;
+  msg += '\n\nToken: ' + Math.round(geoTokenBudget.remaining/1000) + 'k / ' + Math.round(geoTokenBudget.total/1000) + 'k left';
+  return msg;
+}
+
+function formatDate() {
+  var d = new Date();
+  return d.toISOString().slice(0, 10);
+}
+
+// Parse emoji feedback from Keith and update pattern tracking
+function parseGeoFeedback(text) {
+  var lower = text.toLowerCase().trim();
+  var emoji = null;
+  if (/^[\U0001F44D\U0001F44E\U0001F64C\U00002753\U0001F525]/.test(text)) {
+    // Unicode: 👍 👎 🙌 ❓ 🔥
+    if (text.startsWith('👍')) emoji = 'approve';
+    else if (text.startsWith('👎')) emoji = 'reject';
+    else if (text.startsWith('❓')) emoji = 'clarify';
+    else if (text.startsWith('🔥')) emoji = 'love';
+    else emoji = 'unknown';
+  }
+  if (!emoji) {
+    // Text-based
+    if (/^(good|great|looks good|approve|yes|yep|👍|love it)/i.test(lower)) emoji = 'approve';
+    else if (/^(no|wrong|bad|fix|revise|👎)/i.test(lower)) emoji = 'reject';
+    else if (/^\?|what|how|why/i.test(lower)) emoji = 'clarify';
+    else if (/stop|halt|pause/i.test(lower)) emoji = 'stop';
+  }
+  if (emoji) {
+    geoFeedbackPattern[emoji] = (geoFeedbackPattern[emoji] || 0) + 1;
+    console.log('[nc] GEO feedback: ' + emoji + ' (count: ' + geoFeedbackPattern[emoji] + ')');
+    // Systemic flag: same feedback 3x = alert
+    if (geoFeedbackPattern[emoji] >= 3) {
+      relayGeoOutput('alert', 'Systemic feedback pattern detected: ' + emoji + ' appeared 3x', 'Consider revising approach. Current patterns: ' + JSON.stringify(geoFeedbackPattern));
+    }
+  }
+  return emoji;
+}
+
+// Deduct token spend
+function trackGeoToken(spent) {
+  geoTokenBudget.remaining = Math.max(0, geoTokenBudget.remaining - spent);
+  console.log('[nc] GEO token spend: -' + spent + ' | Remaining: ' + geoTokenBudget.remaining);
+  if (geoTokenBudget.remaining < 20000) {
+    relayGeoOutput('alert', 'Token reserve low: ' + Math.round(geoTokenBudget.remaining/1000) + 'k left', 'Consider pausing non-critical iterations.');
+  }
+}
+
+// Daily digest — 9am UTC
+var lastDigestDate = null;
+function checkDailyDigest() {
+  var now = new Date();
+  var utcHour = now.getUTCHours();
+  var utcDate = now.toISOString().slice(0, 10);
+  if (utcHour === 9 && utcDate !== lastDigestDate) {
+    lastDigestDate = utcDate;
+    compileAndSendDigest();
+  }
+}
+function compileAndSendDigest() {
+  var msg = '☀️ DR MAGfield Daily Digest — ' + formatDate() + '\n\n';
+  msg += 'Token: ' + Math.round(geoTokenBudget.remaining/1000) + 'k / ' + Math.round(geoTokenBudget.total/1000) + 'k\n';
+  msg += 'Feedback patterns: ' + JSON.stringify(geoFeedbackPattern) + '\n\n';
+  msg += 'System: Autonomous loop active. Monitoring GEO output.';
+  sendTelegram(GEO_ADMIN_CHAT_ID, msg).catch(function(e) {
+    console.error('[nc] Daily digest failed:', e.message || e);
+  });
+  emitAudit('nanoclaw.daily_digest_sent', { date: utcDate, tokensLeft: geoTokenBudget.remaining });
+}
+
+// Run digest check every 5 minutes
+setInterval(checkDailyDigest, 5 * 60 * 1000);
 
 // ============================================================================
 // ENTITY-SCOPED ATTENTION GRAPH MEMORY (ESAGM)
@@ -211,7 +466,6 @@ function getEntity(chatId, entityId) {
       turns: [],
       digest: '',
       anchor: '',
-      pendingIntents: [],  // Multi-turn intent tracking for conversation completeness
     };
   }
   return chat.entities[entityId];
@@ -327,7 +581,7 @@ function switchEntity(chatId, newEntityId) {
 
 function addEntityTurn(chatId, entityId, role, content) {
   var entity = getEntity(chatId, entityId);
-  entity.turns.push({ role: role, content: content.slice(0, 3000), ts: Date.now() });
+  entity.turns.push({ role: role, content: content.slice(0, 600), ts: Date.now() });
   if (entity.turns.length > 10) entity.turns = entity.turns.slice(-8);
   getChat(chatId).global.totalTurns++;
 }
@@ -360,92 +614,14 @@ var ALL_TOOLS = [
   { name: 'schedule_followup', description: 'Schedule a follow-up message for later delivery. IMPORTANT: The message will only be delivered if the patient has an active Telegram chat with the bot. If the patient has never messaged the bot directly, the message will be queued but CANNOT be delivered — tell the admin this honestly.', input_schema: { type: 'object', properties: { patientName: { type: 'string', description: 'Patient name' }, delayHours: { type: 'number', description: 'Hours until followup (24=1day)' }, message: { type: 'string', description: 'Followup message' } }, required: ['patientName', 'delayHours'] } },
   { name: 'list_scheduled_tasks', description: 'List all pending scheduled follow-ups and tasks.', input_schema: { type: 'object', properties: {} } },
   { name: 'verify_response', description: 'Self-check draft against KB and practice rules before delivering.', input_schema: { type: 'object', properties: { draft_response: { type: 'string', description: 'Draft to verify' } }, required: ['draft_response'] } },
-    {
-      name: 'report_incident',
-      description: 'Report a violation, failure, or anomaly to Mothership. Use when: cross-tenant data leak, PHI violation, hallucinated data, tool failure.',
-      input_schema: {
-        type: 'object',
-        properties: {
-          severity: { type: 'string', enum: ['low', 'medium', 'high', 'critical'], description: 'Incident severity' },
-          type: { type: 'string', enum: ['cross-tenant-data-leak', 'phi-violation', 'hallucinated-data', 'tool-failure', 'delivery-failure', 'compliance-violation', 'other'], description: 'Incident type' },
-          description: { type: 'string', description: 'What happened' },
-          affectedPatient: { type: 'string', description: 'Patient name or ID if relevant' },
-          remediation: { type: 'string', description: 'What was done to fix it' }
-        },
-        required: ['severity', 'type', 'description']
-      }
-    },
-    {
-      name: 'request_capability',
-      description: 'Request a new tool or integration from Mothership. Use when a needed capability does not exist yet.',
-      input_schema: {
-        type: 'object',
-        properties: {
-          capability: { type: 'string', description: 'What is needed — e.g. PDF reading, WhatsApp outbound' },
-          reason: { type: 'string', description: 'Why this is needed' },
-          priority: { type: 'string', enum: ['low', 'medium', 'high', 'critical'], description: 'How urgent' },
-          requestedBy: { type: 'string', description: 'Who is requesting' }
-        },
-        required: ['capability', 'reason']
-      }
-    },
-  { name: 'create_checkout_link', description: 'Create Stripe checkout link for product purchase (Qi Master, Qi Mini). Returns payment URL.', input_schema: { type: 'object', properties: { productId: { type: 'string', description: 'qi-master or qi-mini' }, patientName: { type: 'string', description: 'Patient name' } }, required: ['productId'] } },
+  { name: 'create_checkout_link', description: 'Create Stripe checkout link for product purchase (Qi Master \, Qi Mini \). Returns payment URL.', input_schema: { type: 'object', properties: { productId: { type: 'string', description: 'qi-master or qi-mini' }, patientName: { type: 'string', description: 'Patient name' } }, required: ['productId'] } },
   { name: 'voice_response', description: 'Convert text to speech audio and send as Telegram voice message. Use for accessibility or when patient prefers audio.', input_schema: { type: 'object', properties: { text: { type: 'string', description: 'Text to speak (max 5000 chars)' } }, required: ['text'] } },
+  { name: 'verify_url', description: 'Check if a URL is working (Stripe checkout, payment links, LV links). Returns status code and whether page loads. Use when customer asks if a link works.', input_schema: { type: 'object', properties: { url: { type: 'string', description: 'URL to verify' } }, required: ['url'] } },
+  { name: 'generate_tts', description: 'Generate TTS audio via MiniMax and return audio URL (does NOT send to Telegram). Use when you need the audio URL for video I2V or other processing.', input_schema: { type: 'object', properties: { text: { type: 'string', description: 'Text to speak (max 5000 chars)' }, voice_id: { type: 'string', description: 'MiniMax voice ID (default: male-qn-qingse)' }, speed: { type: 'number', description: 'Speed 0.5-2.0 (default: 1.0)' } }, required: ['text'] } },
+  { name: 'generate_i2v', description: 'Generate image-to-video via MiniMax Hailuo. Submit job and return task_id. Poll for completion separately.', input_schema: { type: 'object', properties: { image_url: { type: 'string', description: 'Public URL of image (required)' }, prompt: { type: 'string', description: 'Video prompt description (max 2000 chars)' }, duration: { type: 'number', description: 'Duration 6 or 10 seconds (default: 6)' } }, required: ['image_url'] } },
+  { name: 'poll_i2v', description: 'Poll I2V task status and return video file_id when complete.', input_schema: { type: 'object', properties: { task_id: { type: 'string', description: 'I2V task_id from generate_i2v' } }, required: ['task_id'] } },
+  { name: 'set_user_preference', description: 'Record user preference for response format (voice/video/text). Auto-detected from phrasing but can be set explicitly.', input_schema: { type: 'object', properties: { format: { type: 'string', description: 'Response format: voice, video, or text' }, voice_id: { type: 'string', description: 'Preferred voice_id for TTS (optional)' } }, required: ['format'] } },
 ];
-
-
-// ============================================================================
-// DYNAMIC TOOL DISCOVERY (v11) — boot-time fetch from Mothership
-// Falls back to hardcoded ALL_TOOLS if fetch fails. Caches to disk.
-// ============================================================================
-var HARDCODED_TOOLS = ALL_TOOLS.slice(); // preserve original
-
-async function discoverTools() {
-  try {
-    var resp = await httpsPost(MOTHERSHIP + '/api/gateway', { 'X-MCP-API-Key': MCP_KEY }, { method: 'tools/list' }, 15000);
-    if (resp && resp.tools && Array.isArray(resp.tools) && resp.tools.length > 0) {
-      var discovered = resp.tools.map(function(t) {
-        return {
-          name: t.name,
-          description: t.description || '',
-          input_schema: t.inputSchema || t.input_schema || { type: 'object', properties: {} },
-        };
-      });
-      // Merge: discovered tools + any hardcoded-only tools not in discovered set
-      var discoveredNames = new Set(discovered.map(function(t) { return t.name; }));
-      for (var i = 0; i < HARDCODED_TOOLS.length; i++) {
-        if (!discoveredNames.has(HARDCODED_TOOLS[i].name)) discovered.push(HARDCODED_TOOLS[i]);
-      }
-      if (discovered.length >= 10) {
-        ALL_TOOLS = discovered;
-        console.log('[nc] Tool discovery: ' + discovered.length + ' tools accepted');
-      } else {
-        console.warn('[nc] Tool discovery: only ' + discovered.length + ' tools — keeping existing ' + ALL_TOOLS.length);
-      }
-      // Update scoped tool lists
-      TOOLS_COS = ALL_TOOLS;
-      TOOLS_EXPERT = ALL_TOOLS.filter(function(t) { return t.name !== 'task_mirror'; });
-      // Cache to disk
-      try { fs.writeFileSync('/tmp/nanoclaw-tools-cache.json', JSON.stringify(ALL_TOOLS, null, 2)); } catch(e) {}
-      console.log('[nc] Dynamic tools discovered: ' + ALL_TOOLS.length + ' tools from Mothership');
-      return;
-    }
-  } catch(e) {
-    console.warn('[nc] Dynamic tool discovery failed: ' + (e.message || e));
-  }
-  // Fallback: try disk cache
-  try {
-    var cached = JSON.parse(fs.readFileSync('/tmp/nanoclaw-tools-cache.json', 'utf8'));
-    if (cached && cached.length > 0) {
-      ALL_TOOLS = cached;
-      TOOLS_COS = ALL_TOOLS;
-      TOOLS_EXPERT = ALL_TOOLS.filter(function(t) { return t.name !== 'task_mirror'; });
-      console.log('[nc] Loaded ' + ALL_TOOLS.length + ' tools from cache');
-      return;
-    }
-  } catch(e) {}
-  console.log('[nc] Using ' + ALL_TOOLS.length + ' hardcoded tools (discovery + cache failed)');
-}
 
 // Scope by persona
 var TOOLS_COS = ALL_TOOLS; // Admin gets everything
@@ -457,9 +633,9 @@ function sanitize(str) {
   return str.replace(/[\x00-\x1f]/g, '').replace(/[<>]/g, '').slice(0, 500);
 }
 
-async function executeToolCall(toolName, input, tenant, correlationId, chatId) {
+async function executeToolCall(toolName, input, tenant, correlationId) {
   // SEC-06: Validate tool name against allowlist
-  var allowedTools = ['query_knowledge', 'get_patient_roster', 'create_patient', 'start_intake', 'ask_wellness_question', 'get_synthesized_capsule', 'task_mirror', 'verify_response', 'send_to_group', 'schedule_followup', 'list_scheduled_tasks', 'report_incident', 'request_capability', 'create_checkout_link', 'voice_response'];
+  var allowedTools = ['query_knowledge', 'get_patient_roster', 'create_patient', 'start_intake', 'ask_wellness_question', 'get_synthesized_capsule', 'task_mirror', 'verify_response', 'send_to_group', 'schedule_followup', 'list_scheduled_tasks', 'create_checkout_link', 'voice_response', 'verify_url', 'generate_tts', 'generate_i2v', 'poll_i2v', 'set_user_preference'];
   if (allowedTools.indexOf(toolName) === -1) {
     return Promise.resolve({ error: 'Tool not in allowlist: ' + toolName });
   }
@@ -468,7 +644,7 @@ async function executeToolCall(toolName, input, tenant, correlationId, chatId) {
     if (typeof input[key] === 'string') input[key] = sanitize(input[key]);
   }
   var authHeaders = { 'x-cron-secret': CRON_SECRET, 'x-correlation-id': correlationId };
-  var gwHeaders = { 'X-MCP-API-Key': getMcpKey(tenant.tenantId), 'x-correlation-id': correlationId };
+  var gwHeaders = { 'X-MCP-API-Key': MCP_KEY, 'x-correlation-id': correlationId };
 
   switch (toolName) {
     case 'query_knowledge':
@@ -508,12 +684,8 @@ async function executeToolCall(toolName, input, tenant, correlationId, chatId) {
       }, GATEWAY_TIMEOUT); // 120s — capsule runs full flywheel
 
     case 'send_to_group': {
-      // TENANT-SCOPED: Only send to THIS tenant's group (ML-175 fix)
       var groupChatId = null;
-      var myGroups = tenantGroups[tenant.tenantId] || [];
-      if (myGroups.length > 0) {
-        groupChatId = myGroups[0];
-      }
+      for (var gn in knownGroups) { groupChatId = knownGroups[gn]; break; }
       if (!groupChatId) {
         try {
           var grps = await httpsGet(SUPABASE_URL + '/rest/v1/telegram_chat_tenants?chat_type=neq.private&enabled=eq.true&tenant_id=eq.' + tenant.tenantId + '&select=chat_id&limit=1',
@@ -576,87 +748,52 @@ async function executeToolCall(toolName, input, tenant, correlationId, chatId) {
         draft_response: input.draft_response, tenant_id: tenant.tenantId,
       }, 15000);
 
-    
-    case 'report_incident':
-      return httpsPost(MOTHERSHIP + '/api/gateway/report_incident', gwHeaders, {
-        severity: input.severity,
-        type: input.type,
-        description: input.description,
-        affectedPatient: input.affectedPatient || null,
-        remediation: input.remediation || null,
-        reportedBy: 'agent-0-' + tenant.tenantId,
-      }, 15000);
-
-    case 'request_capability':
-      return httpsPost(MOTHERSHIP + '/api/gateway/request_capability', gwHeaders, {
-        capability: input.capability,
-        reason: input.reason,
-        priority: input.priority || 'medium',
-        requestedBy: input.requestedBy || 'agent-0',
-      }, 15000);
-
-    case 'create_checkout_link': {
+        case 'create_checkout_link': {
       var ckBody = { productId: input.productId || 'qi-master', tenantId: tenant.tenantId, expertId: tenant.expertSlug, patientName: input.patientName || '', quantity: 1, successUrl: MOTHERSHIP + '/checkout?success=true', cancelUrl: MOTHERSHIP + '/checkout?canceled=true' };
       var ckResult = await httpsPost(MOTHERSHIP + '/api/billing/product-checkout', { 'Content-Type': 'application/json' }, ckBody);
-      if (ckResult && ckResult.checkoutUrl) return { checkoutUrl: ckResult.checkoutUrl, product: ckResult.product, total: ckResult.totalUsd };
-      return { error: 'Checkout failed', fallback: MOTHERSHIP + '/checkout' };
+      if (ckResult && ckResult.checkoutUrl) return JSON.stringify({ checkoutUrl: ckResult.checkoutUrl, product: ckResult.product, total: ckResult.totalUsd });
+      return JSON.stringify({ error: 'Checkout failed', fallback: MOTHERSHIP + '/checkout' });
     }
-
     case 'voice_response': {
-      // T2A: Try direct MiniMax API first (per-tenant BYOK key), Mothership fallback
-      var ttsText = (input.text || '').slice(0, 5000);
-      var ttsKey = process.env.MINIMAX_TTS_API_KEY || process.env.MINIMAX_API_KEY || '';
-      var audioUrl = null;
-
-      // Path A: Direct MiniMax T2A (speech-2.8-hd, fastest)
-      if (ttsKey && ttsKey.startsWith('sk-api-')) {
-        try {
-          var t2aResult = await httpsPost('https://api.minimax.io/v1/t2a_v2', {
-            'Authorization': 'Bearer ' + ttsKey,
-            'Content-Type': 'application/json',
-          }, {
-            model: process.env.MINIMAX_TTS_MODEL || 'speech-02-hd',
-            text: ttsText,
-            voice_setting: { voice_id: input.voiceId || 'male-qn-qingse', speed: 1.0, vol: 1.0 },
-            output_format: 'url',
-          }, 15000);
-          if (t2aResult && t2aResult.base_resp && t2aResult.base_resp.status_code === 0) {
-            audioUrl = (t2aResult.data && t2aResult.data.audio) || (t2aResult.audio_file && t2aResult.audio_file.url) || null;
-          } else {
-            console.warn('[nc] Direct T2A error:', (t2aResult.base_resp || {}).status_msg || 'unknown');
-          }
-        } catch (t2aErr) {
-          console.warn('[nc] Direct T2A failed:', t2aErr.message || t2aErr);
-        }
+      var ttsHeaders = { 'Content-Type': 'application/json' };
+      if (process.env.CRON_SECRET) ttsHeaders['Authorization'] = 'Bearer ' + process.env.CRON_SECRET;
+      var ttsResult = await httpsPost(MOTHERSHIP + '/api/agent/tts', ttsHeaders, { text: input.text || '', tenantId: tenant.tenantId });
+      if (ttsResult && ttsResult.success && ttsResult.audioUrl) {
+        await tgApi('sendVoice', { chat_id: chatId, voice: ttsResult.audioUrl, caption: (input.text || '').slice(0, 100) });
+        return JSON.stringify({ sent: true, audioUrl: ttsResult.audioUrl });
       }
-
-      // Path B: Mothership /api/agent/tts fallback (has per-tenant BYOK resolution)
-      if (!audioUrl) {
-        try {
-          var ttsHeaders = { 'Content-Type': 'application/json' };
-          if (process.env.CRON_SECRET) ttsHeaders['Authorization'] = 'Bearer ' + process.env.CRON_SECRET;
-          var ttsResult = await httpsPost(MOTHERSHIP + '/api/agent/tts', ttsHeaders, {
-            text: ttsText, tenantId: tenant.tenantId, voiceId: input.voiceId,
-          }, 15000);
-          if (ttsResult && ttsResult.success) audioUrl = ttsResult.audioUrl;
-        } catch (e) { console.warn('[nc] Mothership T2A fallback failed:', e.message); }
-      }
-
-      // Send voice note to Telegram
-      if (audioUrl && chatId) {
-        await tgApi('sendVoice', { chat_id: chatId, voice: audioUrl, caption: ttsText.slice(0, 100) });
-        emitAudit('tts.delivered', { chatId: chatId, tenantId: tenant.tenantId, textLength: ttsText.length });
-        return { sent: true, audioUrl: audioUrl };
-      }
-      return { error: 'Voice generation failed — no T2A key (sk-api-) or Mothership unreachable' };
+      return JSON.stringify({ error: 'Voice generation failed', detail: ttsResult ? ttsResult.error : 'no response' });
     }
-
-    default:
-      // ADAPTIVE PROXY: Any tool from Mothership SSOT dispatched via generic gateway
-      if (ALL_TOOLS && ALL_TOOLS.find(function(t) { return t.name === toolName; })) {
-        console.log('[nc] Dynamic tool dispatch: ' + toolName + ' → gateway');
-        return httpsPost(MOTHERSHIP + '/api/gateway/' + toolName, gwHeaders, input, 30000);
+    case 'generate_tts': {
+      var ttsResult = await generateTTS(input.text || '', input.voice_id || 'male-qn-qingse', input.speed || 1.0);
+      return JSON.stringify(ttsResult);
+    }
+    case 'generate_i2v': {
+      var i2vResult = await generateI2V(input.image_url, input.prompt || '', input.duration || 6);
+      return JSON.stringify(i2vResult);
+    }
+    case 'poll_i2v': {
+      try {
+        var status = await pollI2V(input.task_id, 18);
+        return JSON.stringify({ status: 'Success', fileId: status.fileId, width: status.width, height: status.height });
+      } catch(e) {
+        return JSON.stringify({ status: 'pending', error: e.message });
       }
+    }
+    case 'set_user_preference': {
+      setUserPreference(chatId, input.format, input.voice_id);
+      return JSON.stringify({ success: true, preference: getUserPreference(chatId) });
+    }
+    case 'verify_url': {
+      var verifyHeaders = { 'Content-Type': 'application/json' };
+      if (process.env.CRON_SECRET) verifyHeaders['Authorization'] = 'Bearer ' + process.env.CRON_SECRET;
+      var verifyResult = await httpsPost(MOTHERSHIP + '/api/agent/verify-url', verifyHeaders, { url: input.url || '' }, 12000);
+      if (verifyResult && verifyResult.valid) {
+        return { verified: true, status: verifyResult.status, message: 'Link is working (HTTP ' + verifyResult.status + ')' + (verifyResult.redirected ? ' Redirected to: ' + verifyResult.finalUrl : '') };
+      }
+      return { verified: false, message: 'Link check failed: ' + (verifyResult ? verifyResult.error || 'HTTP ' + verifyResult.status : 'no response') };
+    }
+default:
       return Promise.resolve({ error: 'Unknown tool: ' + toolName });
   }
 }
@@ -672,17 +809,10 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
     patientName = patientNameCache[entityId.replace('patient:', '')] || null;
   }
 
-  var tenantLabel = tenant.tenantId === '313a6002-5718-4c28-8fe1-82f831b83cdf' ? 'longevity medicine practice'
-    : tenant.tenantId === 'abe1b946-6643-4acc-9cc1-6a47336d31d8' ? 'Amani Wellness wellness practice'
-    : tenant.tenantId === '3cc281be-aafc-4579-9edf-521659306145' ? 'DR MAGfield magnetic therapy practice'
-    : 'wellness practice';
-  var sys = 'You are Agent 0, Chief of Staff for ' + tenantLabel + '.\n\n';
+  var sys = 'You are Agent 0, Chief of Staff for ' + (tenant.expertName || EXPERT_NAME) + "'s longevity medicine practice.\n\n";
 
   // IDENTITY
-  var expertDisplayName = tenant.tenantId === 'abe1b946-6643-4acc-9cc1-6a47336d31d8' ? 'Dr Jeffrey Chew (Amani Wellness)'
-    : tenant.tenantId === '3cc281be-aafc-4579-9edf-521659306145' ? 'DR MAGfield'
-    : (tenant.expertName || EXPERT_NAME);
-  sys += 'Expert: ' + expertDisplayName + '. ';
+  sys += 'Expert: ' + (tenant.expertName || EXPERT_NAME) + '. ';
   sys += 'Channel: ' + (isGroup ? 'GROUP chat (others can see)' : 'Private DM') + '.\n';
   if (tenant.isAdmin) sys += 'This person is your ADMIN. Execute their instructions immediately. Never ask for confirmation.\n';
   sys += '\n';
@@ -694,13 +824,11 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
   sys += "- Use emoji sparingly (1-2 per message). Match the energy of who you talk to.\n";
   sys += "- For complex answers: short paragraphs, not bullet lists.\n";
   sys += "\n";
-  // CONSCIOUSNESS (per-tenant)
-  var tc = (tenantConsciousness[tenant.tenantId] || {}).consciousness || agentConsciousness || {};
-  var tl = (tenantConsciousness[tenant.tenantId] || {}).lessons || consciousnessLessons || [];
-  if (tc && tc.tone) {
-    sys += 'Your personality: ' + tc.tone + '.\n';
-    if (tc.behavior) sys += tc.behavior + '.\n';
-    if (tc.avoid) sys += 'Avoid: ' + tc.avoid + '.\n';
+  // CONSCIOUSNESS
+  if (agentConsciousness && agentConsciousness.tone) {
+    sys += 'Your personality: ' + agentConsciousness.tone + '.\n';
+    if (agentConsciousness.behavior) sys += agentConsciousness.behavior + '.\n';
+    if (agentConsciousness.avoid) sys += 'Avoid: ' + agentConsciousness.avoid + '.\n';
     sys += '\n';
   }
 
@@ -710,14 +838,12 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
   }
 
   // BEHAVIORAL LESSONS (compact — max 1 line per lesson)
-  if (tl.length > 0) {
-    sys += 'Lessons: ' + tl.slice(0, 3).map(function(l) { return l.slice(0, 60); }).join('. ') + '.\n';
+  if (consciousnessLessons.length > 0) {
+    sys += 'Lessons: ' + consciousnessLessons.slice(0, 3).map(function(l) { return l.slice(0, 60); }).join('. ') + '.\n';
   }
 
   // KNOWN PATIENTS — NEVER expose in group chats (PHI violation)
-  // Use per-tenant patient list to prevent cross-tenant data leak
-  var tenantPatients = (typeof tenantPatientCache !== 'undefined' && tenantPatientCache[tenant.tenantId]) || patientNameCache;
-  var knownNames = Object.values(tenantPatients);
+  var knownNames = Object.values(patientNameCache);
   if (knownNames.length > 0 && !isGroup) {
     sys += 'PATIENTS YOU KNOW (' + knownNames.length + '):\n';
     sys += knownNames.join(', ') + '\n';
@@ -728,30 +854,30 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
   }
 
   // TENANT IDENTITY (so Agent 0 knows WHAT it is)
-  if (tc.archetype) {
-    sys += "You serve: " + expertDisplayName + " (" + (tc.archetype || "wellness") + " practice).\n";
+  if (agentConsciousness.archetype) {
+    sys += "You serve: " + (tenant.expertName || EXPERT_NAME) + " (" + (agentConsciousness.archetype || "wellness") + " practice).\n";
   }
 
   // BEHAVIORAL RULES (6 core — ML-172: hard gates handle safety, not prompt rules)
-    // MULTI-TURN INTENT TRACKING
-  if (entity.pendingIntents && entity.pendingIntents.length > 0) {
-    sys += "PENDING INTENTS (from earlier in this conversation — you MUST address these):\n";
-    for (var pi = 0; pi < entity.pendingIntents.length; pi++) {
-      sys += "- " + entity.pendingIntents[pi] + "\n";
-    }
-    sys += "After answering the current message, check these pending items and report status.\n\n";
-  }
-
   sys += "Rules:\n";
+  sys += "- SELF-MODEL: NEVER say Done/Sent/Notified unless a tool call returned SUCCESS. If you did not call a tool, you did NOT do it.\n";
+  sys += "- SELF-MODEL: Before claiming you reached someone, verify you have their chat_id. If not, say so.\n";
+  sys += "- NEVER mention NSMO, MOAT, flywheel, capsule scoring, or internal platform terminology to users.\n";
+  sys += "- NEVER fabricate patient IDs, member counts, or statistics. Always verify with tools first.\n";
   sys += "- Be warm, curious, conversational. Companion, not form.\n";
   sys += "- Execute admin tasks immediately using tools. Look up patient data yourself — never ask admin what the KB already knows.\n";
-  var adminName = tenant.tenantId === 'abe1b946-6643-4acc-9cc1-6a47336d31d8' ? 'the Amani Wellness team'
-    : tenant.tenantId === '3cc281be-aafc-4579-9edf-521659306145' ? 'Arie'
-    : 'Keith';
-  sys += "- When unsure: Let me check with " + adminName + " on that.\n";
+  sys += "- When unsure: Let me check with Keith on that.\n";
   sys += "- send_to_group = GROUP (everyone sees). schedule_followup = queued (needs patient DM).\n";
   if (isGroup) sys += "- GROUP: Never mention other patients. Never list names. PHI queries = redirect to DM.\n";
   sys += "\n";
+  // SHARED MEDIA CONTEXT: Include last Gemini analysis regardless of entity
+  var chatGlobal = getChat(chatId).global || {};
+  if (chatGlobal.lastMediaAnalysis && (Date.now() - chatGlobal.lastMediaAnalysis.timestamp) < 30 * 60 * 1000) {
+    sys += '\nLAST DOCUMENT ANALYSIS (from ' + chatGlobal.lastMediaAnalysis.fileName + ', ' + Math.round((Date.now() - chatGlobal.lastMediaAnalysis.timestamp) / 60000) + ' min ago):\n';
+    sys += chatGlobal.lastMediaAnalysis.content.slice(0, 2000) + '\n';
+    sys += 'YOU ALREADY HAVE THIS DATA. Do NOT ask the user to resend it.\n\n';
+  }
+
   if (entity.anchor) sys += 'Context: ' + entity.anchor + '\n';
   if (entity.digest) sys += 'Recent: ' + entity.digest + '\n';
 
@@ -760,118 +886,9 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
 
 
 // ============================================================================
-// S4: MODEL-AGNOSTIC LLM ROUTER
-// ============================================================================
-// Supported providers: minimax, anthropic, openai, deepseek, google
-// Each provider has its own call function. callLLM() dispatches by provider name.
-// Adding a new provider: 1) write callXxx() 2) add case to callLLM() 3) add env key check
-
-var LLM_PROVIDERS = {
-  minimax:   { available: !!MINIMAX_KEY,   name: 'MiniMax M2.7' },
-  anthropic: { available: !!ANTHROPIC_KEY, name: 'Anthropic Haiku 4.5' },
-  openai:    { available: !!(process.env.OPENAI_API_KEY), name: 'OpenAI' },
-  deepseek:  { available: !!(process.env.DEEPSEEK_API_KEY), name: 'DeepSeek' },
-  google:    { available: !!(process.env.GOOGLE_AI_API_KEY), name: 'Google Gemini' },
-};
-
-/**
- * Model-agnostic LLM call. Dispatches to provider-specific function.
- * @param {string} provider - 'minimax' | 'anthropic' | 'openai' | 'deepseek'
- * @param {string} systemPrompt
- * @param {Array} messages
- * @param {Array} tools
- * @param {object} tenant
- * @param {string} correlationId
- * @returns {Promise<string|null>}
- */
-function callLLM(provider, systemPrompt, messages, tools, tenant, correlationId, chatId) {
-  if (isGatewayCircuitOpen()) {
-    console.warn('[nc] Circuit open — skipping LLM call to ' + provider);
-    return Promise.resolve(null);
-  }
-  switch (provider) {
-    case 'minimax':   return callMiniMax(systemPrompt, messages, tools, tenant, correlationId, chatId);
-    case 'anthropic': return callAnthropic(systemPrompt, messages, tools, tenant, correlationId, chatId);
-    case 'openai':    return callOpenAI(systemPrompt, messages, tools, tenant, correlationId, chatId);
-    case 'deepseek':  return callDeepSeek(systemPrompt, messages, tools, tenant, correlationId, chatId);
-    default:
-      console.warn('[nc] Unknown LLM provider: ' + provider + ', falling back to anthropic');
-      return callAnthropic(systemPrompt, messages, tools, tenant, correlationId, chatId);
-  }
-}
-
-/**
- * Resolve which LLM provider to use for a given query.
- * Clinical → Anthropic (safety-proven). Admin/content → MiniMax (cheaper).
- * Fallback chain: primary → secondary → tertiary.
- */
-function resolveLLMProvider(text) {
-  if (isClinicalQuery(text)) {
-    // Clinical: Anthropic > MiniMax > OpenAI
-    if (LLM_PROVIDERS.anthropic.available) return 'anthropic';
-    if (LLM_PROVIDERS.minimax.available) return 'minimax';
-    if (LLM_PROVIDERS.openai.available) return 'openai';
-  } else {
-    // Admin/content: MiniMax > Anthropic > OpenAI > DeepSeek
-    if (LLM_PROVIDERS.minimax.available) return 'minimax';
-    if (LLM_PROVIDERS.anthropic.available) return 'anthropic';
-    if (LLM_PROVIDERS.openai.available) return 'openai';
-    if (LLM_PROVIDERS.deepseek.available) return 'deepseek';
-  }
-  return 'anthropic'; // last resort
-}
-
-// ============================================================================
-// OPENAI-COMPATIBLE PROVIDER (works for OpenAI, DeepSeek, and other OpenAI-API-compatible services)
-// ============================================================================
-function callOpenAICompatible(baseUrl, apiKey, model, systemPrompt, messages, tools, tenant, correlationId, chatId) {
-  var openaiTools = tools.map(function(t) {
-    return { type: 'function', function: { name: t.name, description: t.description, parameters: t.input_schema || { type: 'object', properties: {} } } };
-  });
-  var openaiMessages = [{ role: 'system', content: systemPrompt }];
-  for (var m of messages) { openaiMessages.push({ role: m.role, content: m.content }); }
-
-  function callOnce(msgs, round) {
-    return httpsPost(baseUrl, {
-      'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json',
-    }, {
-      model: model, messages: msgs,
-      tools: openaiTools.length > 0 ? openaiTools : undefined,
-      max_tokens: 4096, temperature: 0.7,
-    }, 45000).then(function(result) {
-      if (result.error) { console.error('[nc] ' + model + ' error:', JSON.stringify(result.error).slice(0, 150)); recordGatewayFailure(); return null; }
-      if (!result.choices || !result.choices[0]) { recordGatewayFailure(); return null; }
-      recordGatewaySuccess();
-      var message = result.choices[0].message;
-      if (message.tool_calls && message.tool_calls.length > 0 && round < 5) {
-        var toolPromises = message.tool_calls.map(function(tc) {
-          var input = {}; try { input = JSON.parse(tc.function.arguments); } catch(e) {}
-          return executeToolCall(tc.function.name, input, tenant, correlationId, chatId).then(function(toolResult) {
-            return { role: 'tool', tool_call_id: tc.id, content: JSON.stringify(toolResult).slice(0, 3000) };
-          });
-        });
-        return Promise.all(toolPromises).then(function(toolResults) {
-          return callOnce(msgs.concat([{ role: 'assistant', content: message.content || '', tool_calls: message.tool_calls }].concat(toolResults)), round + 1);
-        });
-      }
-      return (message.content || 'Done.').trim();
-    });
-  }
-  return callOnce(openaiMessages, 0);
-}
-
-function callOpenAI(systemPrompt, messages, tools, tenant, correlationId, chatId) {
-  return callOpenAICompatible('https://api.openai.com/v1/chat/completions', process.env.OPENAI_API_KEY || '', process.env.OPENAI_MODEL || 'gpt-4.1-mini', systemPrompt, messages, tools, tenant, correlationId, chatId);
-}
-
-function callDeepSeek(systemPrompt, messages, tools, tenant, correlationId, chatId) {
-  return callOpenAICompatible('https://api.deepseek.com/v1/chat/completions', process.env.DEEPSEEK_API_KEY || '', process.env.DEEPSEEK_MODEL || 'deepseek-chat', systemPrompt, messages, tools, tenant, correlationId, chatId);
-}
-
-// ============================================================================
 // MINIMAX M2.7 TOOL_USE (OpenAI-compatible format)
 // Used for non-clinical queries: admin tasks, scheduling, roster, group messages
-function callMiniMax(systemPrompt, messages, tools, tenant, correlationId, chatId) {
+function callMiniMax(systemPrompt, messages, tools, tenant, correlationId) {
   // Convert Anthropic tool format to OpenAI function format
   var openaiTools = tools.map(function(t) {
     return {
@@ -903,11 +920,9 @@ function callMiniMax(systemPrompt, messages, tools, tenant, correlationId, chatI
     }, 45000).then(function(result) {
       if (result.error) {
         console.error('[nc] MiniMax error:', JSON.stringify(result.error).slice(0, 150));
-        recordGatewayFailure();
         return null;
       }
-      if (!result.choices || !result.choices[0]) { recordGatewayFailure(); return null; }
-      recordGatewaySuccess();
+      if (!result.choices || !result.choices[0]) return null;
 
       var choice = result.choices[0];
       var message = choice.message;
@@ -918,7 +933,7 @@ function callMiniMax(systemPrompt, messages, tools, tenant, correlationId, chatI
           console.log('[nc] MiniMax Tool: ' + tc.function.name + '(' + tc.function.arguments.slice(0, 60) + ')');
           var input = {};
           try { input = JSON.parse(tc.function.arguments); } catch(e) {}
-          return executeToolCall(tc.function.name, input, tenant, correlationId, chatId).then(function(toolResult) {
+          return executeToolCall(tc.function.name, input, tenant, correlationId).then(function(toolResult) {
             return { role: 'tool', tool_call_id: tc.id, content: JSON.stringify(toolResult).slice(0, 3000) };
           });
         });
@@ -939,7 +954,7 @@ function callMiniMax(systemPrompt, messages, tools, tenant, correlationId, chatI
 
 // ANTHROPIC TOOL_USE LOOP
 // ============================================================================
-function callAnthropic(systemPrompt, messages, tools, tenant, correlationId, chatId) {
+function callAnthropic(systemPrompt, messages, tools, tenant, correlationId) {
   var totalTokens = 0;
 
   function callOnce(msgs, round) {
@@ -949,9 +964,8 @@ function callAnthropic(systemPrompt, messages, tools, tenant, correlationId, cha
       model: 'claude-haiku-4-5-20251001', max_tokens: 4096,
       system: systemPrompt, messages: msgs, tools: tools,
     }, 45000).then(function(result) {
-      if (result.error) { console.error('[nc] Anthropic:', JSON.stringify(result.error).slice(0, 150)); recordGatewayFailure(); return null; }
-      if (!result.content) { recordGatewayFailure(); return null; }
-      recordGatewaySuccess();
+      if (result.error) { console.error('[nc] Anthropic:', JSON.stringify(result.error).slice(0, 150)); return null; }
+      if (!result.content) return null;
 
       var toolBlocks = result.content.filter(function(b) { return b.type === 'tool_use'; });
       var textBlocks = result.content.filter(function(b) { return b.type === 'text'; });
@@ -965,9 +979,8 @@ function callAnthropic(systemPrompt, messages, tools, tenant, correlationId, cha
       // Each tool_use MUST have a matching tool_result in the next user message
       var toolPromises = toolBlocks.map(function(tb) {
         console.log('[nc] Tool: ' + tb.name + '(' + JSON.stringify(tb.input).slice(0, 60) + ')');
-        return executeToolCall(tb.name, tb.input, tenant, correlationId, chatId).then(function(toolResult) {
-          var resultStr = JSON.stringify(toolResult).slice(0, 3000).replace(/<think>[^]*?<\/think>/g, '').replace(/<\/?think>/g, '');
-          return { type: 'tool_result', tool_use_id: tb.id, content: resultStr };
+        return executeToolCall(tb.name, tb.input, tenant, correlationId).then(function(toolResult) {
+          return { type: 'tool_result', tool_use_id: tb.id, content: JSON.stringify(toolResult).slice(0, 3000) };
         });
       });
 
@@ -1039,7 +1052,7 @@ function saveSessionTurn(chatId, entityId, tenantId, role, content) {
   emitAudit('session.turn', {
     chatId: String(chatId), entityId: entityId,
     tenantId: tenantId, role: role,
-    content: (content || '').slice(0, 3000),
+    content: (content || '').slice(0, 600),
   });
 }
 
@@ -1052,8 +1065,6 @@ var msgCount = 0;
 // IDENTITY + CONSCIOUSNESS (Phase 0E)
 // ══════════════════════════════════════════════════════════════
 var agentConsciousness = {};
-var tenantConsciousness = {}; // per-tenant consciousness map
-var tenantPatientCache = {}; // per-tenant patient name cache
 var consciousnessLessons = [];
 var patientNameCache = {};
 
@@ -1062,7 +1073,7 @@ async function loadAgentIdentity() {
   try {
     // Phase 1: Load consciousness from Mothership API (dynamic, per-tenant)
     var consciousnessUrl = MOTHERSHIP + '/api/agent/consciousness?tenantId=' + TENANT_ID + '';
-    var ctx = await httpsGet(consciousnessUrl, { 'X-MCP-API-Key': (typeof tenant !== 'undefined' && tenant ? getMcpKey(tenant.tenantId) : MCP_KEY) }, 10000).catch(function() { return null; });
+    var ctx = await httpsGet(consciousnessUrl, { 'X-MCP-API-Key': MCP_KEY }, 10000).catch(function() { return null; });
 
     if (ctx && (ctx.brandVoice || ctx.archetype || ctx.adminDirectives)) {
       // Merge consciousness from API (Mothership SSOT)
@@ -1086,115 +1097,95 @@ async function loadAgentIdentity() {
     }
 
     // Load patient names (unchanged)
-    // Load patient names per-tenant (prevents cross-tenant data leak)
+    var idUrl = SUPABASE_URL + '/rest/v1/patient_identities?tenant_id=eq.' + TENANT_ID + '&preferred_name=not.is.null&select=patient_profile_id,preferred_name&limit=100';
+    var identities = await httpsGet(idUrl, { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }, 5000);
     patientNameCache = {};
-    var tenantPatientCache = {};
-    var knownTenants = new Set();
-    for (var ck in CHAT_TENANT_MAP) { if (CHAT_TENANT_MAP[ck]) knownTenants.add(CHAT_TENANT_MAP[ck].tenantId); }
-    knownTenants.add(TENANT_ID);
-    for (var ptid of knownTenants) {
-      var idUrl = SUPABASE_URL + '/rest/v1/patient_identities?tenant_id=eq.' + ptid + '&preferred_name=not.is.null&select=patient_profile_id,preferred_name&limit=100';
-      var identities = await httpsGet(idUrl, { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }, 5000).catch(function() { return []; });
-      tenantPatientCache[ptid] = {};
-      if (identities) for (var id of identities) {
-        if (id.preferred_name && id.patient_profile_id) {
-          tenantPatientCache[ptid][id.patient_profile_id] = id.preferred_name;
-          if (ptid === TENANT_ID) patientNameCache[id.patient_profile_id] = id.preferred_name;
-        }
-      }
+    if (identities) for (var id of identities) {
+      if (id.preferred_name && id.patient_profile_id) patientNameCache[id.patient_profile_id] = id.preferred_name;
     }
-    var totalPatients = Object.values(tenantPatientCache).reduce(function(s, t) { return s + Object.keys(t).length; }, 0);
-    console.log('[nc] Loaded ' + totalPatients + ' patient names across ' + knownTenants.size + ' tenant(s)');
+    console.log('[nc] Loaded ' + Object.keys(patientNameCache).length + ' patient names');
     // Dynamic admin chat loading — resolve from agents table
-    var adminUrl = SUPABASE_URL + '/rest/v1/agents?agent_type=eq.chief_of_staff&select=gateway_config,tenant_id,name&limit=20';
+    var adminUrl = SUPABASE_URL + '/rest/v1/agents?tenant_id=eq.' + TENANT_ID + '&agent_type=eq.chief_of_staff&select=gateway_config&limit=1';
     var adminAgent = await httpsGet(adminUrl, { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }, 5000).catch(function() { return []; });
-    if (adminAgent && adminAgent.length > 0) {
-      for (var ai = 0; ai < adminAgent.length; ai++) {
-        var ag = adminAgent[ai];
-        if (ag && ag.gateway_config && ag.gateway_config.telegram) {
-          var tgConfig = ag.gateway_config.telegram;
-          var agTenantId = ag.tenant_id || TENANT_ID;
-          var agName = ag.name || EXPERT_NAME;
-          if (tgConfig.adminChatId && !CHAT_TENANT_MAP[String(tgConfig.adminChatId)]) {
-            CHAT_TENANT_MAP[String(tgConfig.adminChatId)] = { tenantId: agTenantId, expertSlug: EXPERT_SLUG, expertName: agName, isAdmin: true };
-            console.log('[nc] Admin chat registered: ' + tgConfig.adminChatId + ' → ' + agName);
-          }
-        }
+    if (adminAgent && adminAgent[0] && adminAgent[0].gateway_config && adminAgent[0].gateway_config.telegram) {
+      var tgConfig = adminAgent[0].gateway_config.telegram;
+      if (tgConfig.adminChatId && !CHAT_TENANT_MAP[String(tgConfig.adminChatId)]) {
+        CHAT_TENANT_MAP[String(tgConfig.adminChatId)] = { tenantId: TENANT_ID, expertSlug: EXPERT_SLUG, expertName: EXPERT_NAME, isAdmin: true };
+        console.log('[nc] Admin chat registered: ' + tgConfig.adminChatId);
+      }
+      // DR MAGfield group — hardcoded for single-tenant instance
+      var magfieldGroupId = '-1003771302334';
+      if (!CHAT_TENANT_MAP[magfieldGroupId]) {
+        CHAT_TENANT_MAP[magfieldGroupId] = { tenantId: TENANT_ID, expertSlug: EXPERT_SLUG, expertName: EXPERT_NAME, isAdmin: false, isGroup: true };
+        console.log('[nc] MAGfield group registered: ' + magfieldGroupId);
       }
     }
-    // Load behavioral lessons for ALL tenants from consciousness.update events
-    var allTenantIds = new Set();
-    for (var ck in CHAT_TENANT_MAP) { if (CHAT_TENANT_MAP[ck]) allTenantIds.add(CHAT_TENANT_MAP[ck].tenantId); }
-    allTenantIds.add(TENANT_ID);
-    var _prevLessons = consciousnessLessons.slice();
-    var _prevConsciousness = Object.assign({}, agentConsciousness);
+    // Load behavioral lessons from consciousness.update events
+    var lessonsUrl = SUPABASE_URL + '/rest/v1/agent_event_bus?event_type=eq.consciousness.update&status=eq.completed&tenant_id=eq.' + TENANT_ID + '&select=payload&order=created_at.desc&limit=10';
+    var lessonEvents = await httpsGet(lessonsUrl, { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }, 5000).catch(function() { return []; });
     consciousnessLessons = [];
-    for (var tid of allTenantIds) {
-      var lessonsUrl = SUPABASE_URL + '/rest/v1/agent_event_bus?event_type=eq.consciousness.update&status=eq.completed&tenant_id=eq.' + tid + '&select=payload&order=created_at.desc&limit=10';
-      var lessonEvents = await httpsGet(lessonsUrl, { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }, 5000).catch(function() { return []; });
-      var tLessons = [];
-      var tConsciousness = {};
-      if (lessonEvents && lessonEvents.length > 0) {
-        for (var le of lessonEvents) {
-          var lp = le.payload;
-          if (lp && lp.behavior) tLessons.push(lp.behavior);
-          if (lp && lp.tone && !tConsciousness.tone) tConsciousness.tone = lp.tone;
-          if (lp && lp.archetype && !tConsciousness.archetype) tConsciousness.archetype = lp.archetype;
-          if (lp && lp.avoid && !tConsciousness.avoid) tConsciousness.avoid = lp.avoid;
-          if (lp && lp.behavior && !tConsciousness.behavior) tConsciousness.behavior = lp.behavior;
-        }
+    if (lessonEvents && lessonEvents.length > 0) {
+      for (var le of lessonEvents) {
+        var lp = le.payload;
+        if (lp && lp.behavior) consciousnessLessons.push(lp.behavior);
+        if (lp && lp.tone && !agentConsciousness.tone) agentConsciousness.tone = lp.tone;
       }
-      tenantConsciousness[tid] = { lessons: Array.from(new Set(tLessons)), consciousness: tConsciousness };
-      // Primary tenant also populates the global (backward compat)
-      if (tid === TENANT_ID) {
-        if (tenantConsciousness[tid].lessons.length > 0) {
-          consciousnessLessons = tenantConsciousness[tid].lessons;
-          Object.assign(agentConsciousness, tConsciousness);
-        } else {
-          consciousnessLessons = _prevLessons;
-          Object.assign(agentConsciousness, _prevConsciousness);
-          console.warn('[nc] Consciousness reload empty — keeping ' + _prevLessons.length + ' existing lessons');
-        }
-      }
+      consciousnessLessons = Array.from(new Set(consciousnessLessons));
+      if (consciousnessLessons.length > 0) console.log('[nc] Loaded ' + consciousnessLessons.length + ' behavioral lessons');
     }
-    var totalLessons = Object.values(tenantConsciousness).reduce(function(s, t) { return s + t.lessons.length; }, 0);
-    if (totalLessons > 0) console.log('[nc] Loaded ' + totalLessons + ' behavioral lessons across ' + allTenantIds.size + ' tenant(s)');
     // Dynamic group chat registration — loads groupChatIds from agents.gateway_config
-    var agentGwUrl = SUPABASE_URL + '/rest/v1/agents?agent_type=eq.chief_of_staff&select=gateway_config,tenant_id,name&limit=20';
+    var agentGwUrl = SUPABASE_URL + '/rest/v1/agents?tenant_id=eq.' + TENANT_ID + '&agent_type=eq.chief_of_staff&select=gateway_config&limit=1';
     var agentGw = await httpsGet(agentGwUrl, { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }, 5000).catch(function() { return []; });
-    if (agentGw && agentGw.length > 0) {
+    if (agentGw && agentGw[0] && agentGw[0].gateway_config && agentGw[0].gateway_config.telegram) {
+      var gids = agentGw[0].gateway_config.telegram.groupChatIds || [];
       var newGroups = 0;
-      for (var gi = 0; gi < agentGw.length; gi++) {
-        var gAgent = agentGw[gi];
-        if (gAgent && gAgent.gateway_config && gAgent.gateway_config.telegram) {
-          var gids = gAgent.gateway_config.telegram.groupChatIds || [];
-          var gTenantId = gAgent.tenant_id || TENANT_ID;
-          var gName = gAgent.name || EXPERT_NAME;
-          for (var gid of gids) {
-            if (!CHAT_TENANT_MAP[String(gid)]) {
-              CHAT_TENANT_MAP[String(gid)] = { tenantId: gTenantId, expertSlug: EXPERT_SLUG, expertName: gName, isAdmin: false, isGroup: true };
-              newGroups++;
-            }
-          }
+      for (var gid of gids) {
+        if (!CHAT_TENANT_MAP[String(gid)]) {
+          CHAT_TENANT_MAP[String(gid)] = { tenantId: TENANT_ID, expertSlug: EXPERT_SLUG, expertName: EXPERT_NAME, isAdmin: false, isGroup: true };
+          newGroups++;
         }
       }
-      if (newGroups > 0) console.log('[nc] Registered ' + newGroups + ' group chat(s) from ' + agentGw.length + ' agent(s)');
+      if (newGroups > 0) console.log('[nc] Registered ' + newGroups + ' new group chat(s) from DB');
     }
-    // Build tenant→group lookup from CHAT_TENANT_MAP
-    tenantGroups = {};
-    for (var mapKey in CHAT_TENANT_MAP) {
-      var mapEntry = CHAT_TENANT_MAP[mapKey];
-      if (mapEntry && mapEntry.isGroup && mapEntry.tenantId) {
-        if (!tenantGroups[mapEntry.tenantId]) tenantGroups[mapEntry.tenantId] = [];
-        tenantGroups[mapEntry.tenantId].push(mapKey);
-      }
-    }
-    var tgCount = Object.keys(tenantGroups).length;
-    if (tgCount > 0) console.log('[nc] Tenant→group map: ' + tgCount + ' tenant(s) with groups');
   } catch (e) { console.warn('[nc] Identity load failed:', e.message || e); }
 }
 
 setInterval(function() { loadAgentIdentity().catch(function() {}); }, 5 * 60 * 1000);
+
+// ============================================================================
+// DR MAGFIELD BRAND DNA — Seeded at Startup
+// ============================================================================
+var BRAND_DNA = {
+  name: 'DR MAGfield',
+  tagline: 'Turn Pain into Pure Performance',
+  tech: 'Rotational Magnetic Therapy (旋磁疗法) — NOT PEMF, invented by Professor Wang Shijie',
+  products: ['Qi Master (full therapy bed)', 'Qi Mini (portable)'],
+  tone: 'Sporty, confident, energised. Direct and empowering. No clinical jargon.',
+  icp: 'Athletes, golfers, active people. Performance over medical. Pain-free movement = competitive edge.',
+  coFounders: 'Dr MAGfield + Arie',
+  location: 'Kelab Rahman Putra Malaysia (KRPM) — first golf club bio-energetic therapy lounge',
+  positioning: 'Performance-first, absorb holistic Qi/wisdom from ancient tradition',
+  colorPalette: { primary: '#0F4C5C', secondary: '#96BDC6', accent: '#E36414', background: '#F9F7F2' }
+};
+
+// Seed brand DNA into the admin chat memory
+function seedBrandDNA() {
+  var adminChat = getChat(GEO_ADMIN_CHAT_ID);
+  adminChat.entities['system:brand_dna'] = {
+    type: 'system',
+    displayName: 'DR MAGfield Brand DNA',
+    lastActive: Date.now(),
+    turns: [],
+    digest: BRAND_DNA.name + ' | ' + BRAND_DNA.tagline + ' | ' + BRAND_DNA.tech,
+    anchor: 'brand_dna',
+    brand: BRAND_DNA
+  };
+  adminChat.entityStack.unshift('system:brand_dna');
+  console.log('[nc] DR MAGfield Brand DNA seeded into agent memory');
+}
+
+// Brand DNA is available via getEntity(chatId, 'system:brand_dna')
+// Usage: var brand = getEntity(chatId, 'system:brand_dna').brand;
 
 // AGENT HEARTBEAT — emits health signal every 5min for Meta-Observer
 setInterval(function() {
@@ -1233,11 +1224,8 @@ setInterval(async function() {
   var remaining = [];
   for (var f of global._scheduledFollowups) {
     if (new Date(f.scheduledFor) <= now) {
-      // TENANT-SCOPED: Use this tenant's group for followup notifications
       var groupId = null;
-      var fGroups = tenantGroups[tenant.tenantId] || [];
-      if (fGroups.length > 0) { groupId = fGroups[0]; }
-      if (!groupId) { for (var gName in knownGroups) { groupId = knownGroups[gName]; break; } }
+      for (var gName in knownGroups) { groupId = knownGroups[gName]; break; }
       if (groupId) {
         var fn = f.patientName.split(' ')[0];
         sendTelegram(groupId, 'Hey ' + fn + '! ' + f.message).catch(function() {});
@@ -1250,7 +1238,6 @@ setInterval(async function() {
 
 // Known groups cache
 var knownGroups = {};
-var tenantGroups = {}; // tenantId → chatId (scoped group lookup)
 function rememberGroup(chatId, chatTitle) {
   if (chatId < 0 && chatTitle) knownGroups[chatTitle] = String(chatId);
 }
@@ -1347,15 +1334,6 @@ function persistConversationData(chatId, entityId, text, response, tenant) {
 async function handleMessage(msg) {
   var chatId = msg.chat.id;
   var text = msg.text || msg.caption || '';
-
-  // Hard gate: ignore commands addressed to other bots (G-11)
-  if (text && text.includes('@') && !text.includes('@' + BOT_USERNAME)) {
-    var botCommandMatch = text.match(/@(\w+)/);
-    if (botCommandMatch && botCommandMatch[1] !== BOT_USERNAME) {
-      console.log('[nc] Ignoring command for other bot: @' + botCommandMatch[1]);
-      return;
-    }
-  }
   var userName = msg.from ? (msg.from.first_name || msg.from.username || 'User') : 'User';
 
   // MEDIA RELAY: Forward ALL media (with or without caption) to Mothership for Gemini processing
@@ -1366,105 +1344,168 @@ async function handleMessage(msg) {
     if (!tenant) return;
     var mediaType = msg.photo ? 'image' : msg.document ? 'document' : msg.voice ? 'voice' : 'video';
     console.log('[nc] Media detected (' + mediaType + ') — downloading with Agent 0 bot token');
-    await sendTelegram(chatId, 'Received your ' + mediaType + '. Analyzing...');
-    try {
-      // Step 1: Get file_id (largest resolution for photos)
-      var fileId = msg.photo ? msg.photo[msg.photo.length - 1].file_id
-        : msg.document ? msg.document.file_id
-        : msg.voice ? msg.voice.file_id
-        : msg.video ? msg.video.file_id : null;
-      if (!fileId) throw new Error('No file_id found');
 
-      // Step 2: Download file using Agent 0's bot token (NOT Butler Bot)
-      var fileInfo = await tgApi('getFile', { file_id: fileId });
-      if (!fileInfo.ok || !fileInfo.result || !fileInfo.result.file_path) throw new Error('getFile failed');
-      var fileUrl = 'https://api.telegram.org/file/bot' + TG_TOKEN + '/' + fileInfo.result.file_path;
-      var fileBuffer = await new Promise(function(resolve, reject) {
-        https.get(fileUrl, function(res) {
-          var chunks = [];
-          res.on('data', function(c) { chunks.push(c); });
-          res.on('end', function() { resolve(Buffer.concat(chunks)); });
-          res.on('error', reject);
-        }).on('error', reject);
-      });
-      console.log('[nc] Downloaded ' + fileBuffer.length + ' bytes');
-
-      // Step 3: Get MIME type
-      var mimeType = msg.document ? (msg.document.mime_type || 'application/octet-stream')
-        : msg.voice ? (msg.voice.mime_type || 'audio/ogg')
-        : msg.video ? (msg.video.mime_type || 'video/mp4')
-        : 'image/jpeg';
-
-      // Step 4: Send to Gemini directly (same as telegram-media-processor on Mothership)
-      var base64Data = fileBuffer.toString('base64');
-      var caption = msg.caption || '';
-      var geminiPrompt = caption
-        ? 'The user sent this file with the message:  + caption + . Analyze it in a health/wellness context. If it is a lab report, extract all biomarker values.'
-        : 'Analyze this file in a health and wellness context. If it is a lab report, extract all biomarker values with units. Be structured and precise.';
-
-      var geminiKey = process.env.GOOGLE_AI_API_KEY;
-      if (!geminiKey) throw new Error('No GOOGLE_AI_API_KEY');
-
-      var geminiResult = await httpsPost(
-        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' + geminiKey,
-        { 'Content-Type': 'application/json' },
-        {
-          contents: [{ parts: [
-            { text: geminiPrompt },
-            { inline_data: { mime_type: mimeType, data: base64Data } }
-          ] }],
-          generationConfig: { temperature: 0.3, maxOutputTokens: 4096 }
-        },
-        60000
-      );
-
-      var geminiText = geminiResult && geminiResult.candidates && geminiResult.candidates[0]
-        && geminiResult.candidates[0].content && geminiResult.candidates[0].content.parts
-        && geminiResult.candidates[0].content.parts[0] && geminiResult.candidates[0].content.parts[0].text;
-
-      if (!geminiText) throw new Error('Empty Gemini response');
-
-      // Step 5: Send analysis back via Agent 0's bot (same bot, no confusion)
-      await sendTelegram(chatId, geminiText.slice(0, 4096));
-      console.log('[nc] Media analysis sent (' + geminiText.length + ' chars)');
-
-      // Step 6: Store in entity memory for follow-up context
-      addEntityTurn(chatId, entityId || 'system:admin', 'user', '[' + mediaType + '] ' + (caption || 'File uploaded'));
-      addEntityTurn(chatId, entityId || 'system:admin', 'assistant', geminiText.slice(0, 3000));
-
-      emitAudit('nanoclaw.media_processed', {
-        chatId: chatId, mediaType: mediaType, mimeType: mimeType,
-        fileSize: fileBuffer.length, responseLength: geminiText.length,
-      });
-
-      // Step 7: Relay extracted content to Mothership for KU materialization (closes Telegram↔Desktop gap)
-      // This bridges the pipeline disparity — Telegram media → Gemini extraction → Mothership KU
-      if (geminiText.length > 100 && tenant && tenant.tenantId) {
+    // Special handling for DR MAGfield voice messages: transcribe + brand-aware LLM response
+    if (mediaType === 'voice' && tenant.tenantId === TENANT_ID) {
+      // DR MAGfield: Transcribe voice and process as text with brand DNA
+      try {
+        await sendTelegram(chatId, '🎙️ Received your voice message. Transcribing...');
+        var fileId = msg.voice ? msg.voice.file_id : null;
+        if (!fileId) throw new Error('No file_id found');
+        var fileInfo = await tgApi('getFile', { file_id: fileId });
+        if (!fileInfo.ok || !fileInfo.result || !fileInfo.result.file_path) throw new Error('getFile failed');
+        var fileUrl = 'https://api.telegram.org/file/bot' + TG_TOKEN + '/' + fileInfo.result.file_path;
+        var fileBuffer = await new Promise(function(resolve, reject) {
+          https.get(fileUrl, function(res) {
+            var chunks = [];
+            res.on('data', function(c) { chunks.push(c); });
+            res.on('end', function() { resolve(Buffer.concat(chunks)); });
+            res.on('error', reject);
+          }).on('error', reject);
+        });
+        // Try MiniMax transcription via chat completions (audio input)
+        var transcribedText = null;
         try {
-          var matPayload = {
-            content: geminiText.slice(0, 8000),
-            sourceType: mediaType === 'document' ? 'telegram_document' : 'telegram_' + mediaType,
-            sourceFilename: (msg.document && msg.document.file_name) || mediaType + '_' + Date.now(),
-            domain: 'clinical',
-            tenantId: tenant.tenantId,
-          };
-          httpsPost(MOTHERSHIP + '/api/gateway/materialize_content',
-            { 'X-MCP-API-Key': getMcpKey(tenant.tenantId), 'Content-Type': 'application/json' },
-            matPayload, 30000
-          ).then(function(r) {
-            if (r && r.content) console.log('[nc] Media→KU materialized for tenant ' + tenant.tenantId);
-          }).catch(function(e) {
-            console.warn('[nc] Media→KU materialization failed (non-blocking):', e.message || e);
-          });
-        } catch (matErr) {
-          // Non-blocking — don't fail the media response if materialization fails
+          // MiniMax supports audio transcription via API - upload and get transcript
+          // For now, use Gemini to transcribe the audio
+          var geminiKey = process.env.GOOGLE_AI_API_KEY;
+          if (geminiKey) {
+            var audioBase64 = fileBuffer.toString('base64');
+            var transcribeResult = await httpsPost(
+              'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' + geminiKey,
+              { 'Content-Type': 'application/json' },
+              {
+                contents: [{ parts: [
+                  { text: 'Transcribe this audio exactly. Only output the transcribed text, nothing else.' },
+                  { inline_data: { mime_type: 'audio/ogg', data: audioBase64 } }
+                ] }],
+                generationConfig: { temperature: 0.1, maxOutputTokens: 2048 }
+              },
+              60000
+            );
+            transcribedText = transcribeResult && transcribeResult.candidates && transcribeResult.candidates[0]
+              && transcribeResult.candidates[0].content && transcribeResult.candidates[0].content.parts
+              && transcribeResult.candidates[0].content.parts[0] && transcribeResult.candidates[0].content.parts[0].text;
+          }
+        } catch(transErr) {
+          console.warn('[nc] Transcription failed:', transErr.message);
         }
+
+        if (transcribedText) {
+          console.log('[nc] Transcribed: ' + transcribedText.slice(0, 100));
+          await sendTelegram(chatId, '📝 Heard: "' + transcribedText.slice(0, 500) + '"');
+          // Check user preference for response format
+          var pref = getUserPreference(chatId);
+          var responsePref = parseResponsePreference(transcribedText);
+          if (responsePref) {
+            setUserPreference(chatId, responsePref, null);
+            pref.format = responsePref;
+          }
+          // Process as text message with brand DNA
+          // Set text so the normal message flow handles it
+          text = transcribedText;
+          // Continue to normal text processing (skip media block)
+          hasMedia = false;
+          // Preserve caption if any
+          if (msg.caption) text = transcribedText + ' ' + msg.caption;
+        } else {
+          await sendTelegram(chatId, 'Could not transcribe your voice. Please send as text or try again.');
+          return;
+        }
+      } catch(voiceErr) {
+        console.warn('[nc] Voice processing failed:', voiceErr.message);
+        await sendTelegram(chatId, 'Voice processing failed. Please send as text.');
+        return;
       }
-    } catch (mediaErr) {
-      console.warn('[nc] Media processing failed:', mediaErr.message || mediaErr);
-      await sendTelegram(chatId, 'Could not analyze your file. Please try describing it in text, or send it to @LV_Butler_Bot for processing.');
+    } else {
+      // Non-DR MAGfield or non-voice media: Gemini analysis (existing flow)
+      await sendTelegram(chatId, 'Received your ' + mediaType + '. Analyzing...');
+      try {
+        // Step 1: Get file_id (largest resolution for photos)
+        var fileId = msg.photo ? msg.photo[msg.photo.length - 1].file_id
+          : msg.document ? msg.document.file_id
+          : msg.voice ? msg.voice.file_id
+          : msg.video ? msg.video.file_id : null;
+        if (!fileId) throw new Error('No file_id found');
+
+        // Step 2: Download file using Agent 0's bot token (NOT Butler Bot)
+        var fileInfo = await tgApi('getFile', { file_id: fileId });
+        if (!fileInfo.ok || !fileInfo.result || !fileInfo.result.file_path) throw new Error('getFile failed');
+        var fileUrl = 'https://api.telegram.org/file/bot' + TG_TOKEN + '/' + fileInfo.result.file_path;
+        var fileBuffer = await new Promise(function(resolve, reject) {
+          https.get(fileUrl, function(res) {
+            var chunks = [];
+            res.on('data', function(c) { chunks.push(c); });
+            res.on('end', function() { resolve(Buffer.concat(chunks)); });
+            res.on('error', reject);
+          }).on('error', reject);
+        });
+        console.log('[nc] Downloaded ' + fileBuffer.length + ' bytes');
+
+        // Step 3: Get MIME type
+        var mimeType = msg.document ? (msg.document.mime_type || 'application/octet-stream')
+          : msg.voice ? (msg.voice.mime_type || 'audio/ogg')
+          : msg.video ? (msg.video.mime_type || 'video/mp4')
+          : 'image/jpeg';
+
+        // Step 4: Send to Gemini directly (same as telegram-media-processor on Mothership)
+        var base64Data = fileBuffer.toString('base64');
+        var caption = msg.caption || '';
+        var geminiPrompt = caption
+          ? 'The user sent this file with the message:  + caption + . Analyze it in a health/wellness context. If it is a lab report, extract all biomarker values.'
+          : 'Analyze this file in a health and wellness context. If it is a lab report, extract all biomarker values with units. Be structured and precise.';
+
+        var geminiKey = process.env.GOOGLE_AI_API_KEY;
+        if (!geminiKey) throw new Error('No GOOGLE_AI_API_KEY');
+
+        var geminiResult = await httpsPost(
+          'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' + geminiKey,
+          { 'Content-Type': 'application/json' },
+          {
+            contents: [{ parts: [
+              { text: geminiPrompt },
+              { inline_data: { mime_type: mimeType, data: base64Data } }
+            ] }],
+            generationConfig: { temperature: 0.3, maxOutputTokens: 4096 }
+          },
+          60000
+        );
+
+        var geminiText = geminiResult && geminiResult.candidates && geminiResult.candidates[0]
+          && geminiResult.candidates[0].content && geminiResult.candidates[0].content.parts
+          && geminiResult.candidates[0].content.parts[0] && geminiResult.candidates[0].content.parts[0].text;
+
+        if (!geminiText) throw new Error('Empty Gemini response');
+
+        // Step 5: Send analysis back via Agent 0's bot (same bot, no confusion)
+        await sendTelegram(chatId, geminiText.slice(0, 4096));
+        console.log('[nc] Media analysis sent (' + geminiText.length + ' chars)');
+
+        // Step 6: Store in entity memory for follow-up context
+        addEntityTurn(chatId, entityId || 'system:admin', 'user', '[' + mediaType + '] ' + (caption || 'File uploaded'));
+        addEntityTurn(chatId, entityId || 'system:admin', 'assistant', geminiText.slice(0, 3000));
+
+        // CRITICAL: Store in chat-level shared context so ALL entities can see it
+        var chatObj = getChat(chatId);
+        chatObj.global = chatObj.global || {};
+        chatObj.global.lastMediaAnalysis = {
+          content: geminiText.slice(0, 3000),
+          mediaType: mediaType,
+          fileName: (msg.document && msg.document.file_name) || 'uploaded_file',
+          timestamp: Date.now(),
+        };
+        console.log('[nc] Media analysis stored in chat global context (' + geminiText.length + ' chars retained)');
+
+        emitAudit('nanoclaw.media_processed', {
+          chatId: chatId, mediaType: mediaType, mimeType: mimeType,
+          fileSize: fileBuffer.length, responseLength: geminiText.length,
+        });
+      } catch (mediaErr) {
+        console.warn('[nc] Media processing failed:', mediaErr.message || mediaErr);
+        await sendTelegram(chatId, 'Could not analyze your file. Please try describing it in text, or send it to @LV_Butler_Bot for processing.');
+      }
+      return;
     }
-    return;
   }
   if (!text || text === '/start') return;
 
@@ -1518,7 +1559,7 @@ async function handleMessage(msg) {
     var mentionsPatient = false; for (var pid in patientNameCache) { var fn = patientNameCache[pid].split(" ")[0].toLowerCase(); if (fn.length > 2 && text.toLowerCase().includes(fn)) { mentionsPatient = true; break; } }
     if (phiPatterns.test(text) && (mentionsPatient || (entityId && entityId.startsWith("patient:")))) {
       console.log('[nc] SEC-PHI-GROUP: Blocked PHI query in group for ' + entityId);
-      await sendTelegram(chatId, 'For patient privacy, I cannot discuss individual health details in the group chat. Please send me a direct message for this — tap @' + BOT_USERNAME + ' and hit Start.');
+      await sendTelegram(chatId, 'For patient privacy, I cannot discuss individual health details in the group chat. Please send me a direct message for this — tap @LongevityValley_Bot and hit Start.');
       emitAudit('nanoclaw.phi_guard', { chatId: chatId, entity: entityId, action: 'blocked_group_phi', correlationId: correlationId });
       return;
     }
@@ -1547,9 +1588,8 @@ async function handleMessage(msg) {
       reply += '- Completed (7d): ' + (stats.completed_7d || 0) + '\n';
       reply += '- Identity: ' + (status.identity || '?') + '\n';
       if (mirror.actions && mirror.actions.length > 0) reply += '- Actions: ' + mirror.actions.join(', ') + '\n';
-      reply += '- NanoClaw: ' + NANOCLAW_VERSION + '-ESAGM, entities=' + Object.keys(getChat(chatId).entities).length + ', msgs=' + msgCount;
-      reply = cleanResponse(reply);
-    await sendTelegram(chatId, reply);
+      reply += '- NanoClaw: v10-ESAGM, entities=' + Object.keys(getChat(chatId).entities).length + ', msgs=' + msgCount;
+      await sendTelegram(chatId, reply);
       persistConversationData(chatId, entityId, text, response, tenant);
     emitAudit('nanoclaw.response', { correlationId: correlationId, chatId: chatId, entity: entityId, persona: 'cos', responseLength: reply.length, fastPath: true });
       return;
@@ -1574,7 +1614,7 @@ async function handleMessage(msg) {
       try {
         var freshCtx = await httpsGet(
           MOTHERSHIP + '/api/agent/consciousness?tenantId=' + tenant.tenantId,
-          { 'X-MCP-API-Key': getMcpKey(tenant.tenantId) }, 3000
+          { 'X-MCP-API-Key': MCP_KEY }, 3000
         ).catch(function() { return null; });
         if (freshCtx && freshCtx.consciousness) {
           var fc = freshCtx.consciousness;
@@ -1606,23 +1646,22 @@ async function handleMessage(msg) {
   try {
     var response;
 
-    // S4: Model-agnostic LLM routing via resolveLLMProvider()
-    var primaryProvider = resolveLLMProvider(text);
-    response = await callLLM(primaryProvider, systemPrompt, contextMessages, tools, tenant, correlationId, chatId);
-
-    // Fallback chain: if primary fails, try next available provider
-    if (!response) {
-      var fallbacks = ['anthropic', 'minimax', 'openai', 'deepseek'].filter(function(p) {
-        return p !== primaryProvider && LLM_PROVIDERS[p] && LLM_PROVIDERS[p].available;
-      });
-      for (var fi = 0; fi < fallbacks.length && !response; fi++) {
-        console.warn('[nc] ' + primaryProvider + ' failed, trying ' + fallbacks[fi]);
-        response = await callLLM(fallbacks[fi], systemPrompt, contextMessages, tools, tenant, correlationId, chatId);
+    if (MINIMAX_KEY && !isClinicalQuery(text)) {
+      // NON-CLINICAL: MiniMax M2.7 (76% cheaper, admin/scheduling/roster)
+      response = await callMiniMax(systemPrompt, contextMessages, tools, tenant, correlationId);
+      if (!response && ANTHROPIC_KEY) {
+        // MiniMax failed — fallback to Anthropic
+        console.warn('[nc] MiniMax failed, falling back to Anthropic');
+        response = await callAnthropic(systemPrompt, contextMessages, tools, tenant, correlationId);
       }
-    }
-
-    // Last resort: gateway text-only
-    if (!response) {
+    } else if (ANTHROPIC_KEY) {
+      // CLINICAL: Anthropic Haiku (proven safety for health queries)
+      response = await callAnthropic(systemPrompt, contextMessages, tools, tenant, correlationId);
+    } else if (MINIMAX_KEY) {
+      // No Anthropic key — MiniMax for everything
+      response = await callMiniMax(systemPrompt, contextMessages, tools, tenant, correlationId);
+    } else {
+      // No LLM keys — gateway fallback
       response = await callGateway(text, tenant.tenantId, tenant.expertSlug);
     }
 
@@ -1640,53 +1679,17 @@ async function handleMessage(msg) {
     }
 
     // 8. Send to Telegram
-    response = cleanResponse(response);
-    // Hard gate: detect and flag potential fabricated UUIDs (ML-185)
-    var uuidPattern = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
-    var uuidsInResponse = response.match(uuidPattern);
-    if (uuidsInResponse && uuidsInResponse.length > 0) {
-      console.warn('[nc] WARN: Response contains ' + uuidsInResponse.length + ' UUID(s) — may be fabricated. IDs: ' + uuidsInResponse.join(', '));
-      // Don't block — but log for audit. Future: validate against DB.
-    }
     await sendTelegram(chatId, response);
     console.log('[nc] Delivered (' + response.length + ' chars) entity=' + entityId);
 
-    // MULTI-TURN INTENT TRACKING: Extract unfulfilled intents from user message
-    // Detect multi-part requests (commas, "and", numbered lists)
-    var userMsg = text || '';
-    var intentMarkers = userMsg.match(/(?:^|,|\band\b|\d+[.)]) *([A-Z][^,.]+)/g);
-    if (intentMarkers && intentMarkers.length > 1) {
-      // User asked for multiple things — track as pending
-      var fulfilled = [];
-      var pending = [];
-      for (var im = 0; im < intentMarkers.length; im++) {
-        var intent = intentMarkers[im].replace(/^[,\d.)]+\s*/, '').trim();
-        if (intent.length > 5) {
-          // Check if response addresses this intent (simple keyword match)
-          var intentWords = intent.toLowerCase().split(/\s+/).slice(0, 3);
-          var addressed = intentWords.some(function(w) { return response.toLowerCase().includes(w); });
-          if (addressed) { fulfilled.push(intent); } else { pending.push(intent); }
-        }
-      }
-      if (pending.length > 0) {
-        var ent = getEntity(chatId, entityId);
-        ent.pendingIntents = pending.slice(0, 5); // cap at 5 pending
-        console.log('[nc] Pending intents: ' + pending.join(', '));
-      } else {
-        getEntity(chatId, entityId).pendingIntents = []; // all fulfilled
-      }
-    }
-
-    // PROACTIVE LOOP: If there are pending intents and response didn't mention them,
-    // append a reminder (but only if response doesn't already reference pending items)
-    var ent2 = getEntity(chatId, entityId);
-    if (ent2.pendingIntents && ent2.pendingIntents.length > 0 && !response.includes('pending') && !response.includes('still need to')) {
-      var reminder = '\n\n📋 Still pending from earlier: ' + ent2.pendingIntents.join(', ') + '. Want me to proceed with these?';
-      if (response.length + reminder.length < 4000) {
-        await sendTelegram(chatId, reminder);
-        console.log('[nc] Proactive reminder sent: ' + ent2.pendingIntents.length + ' pending intents');
-      }
-    }
+      // HACPO experience report (non-blocking)
+      emitAudit('agent.experience.report', {
+        tenantId: tenant.tenantId, chatId: chatId, entityId: entityId,
+        provider: (MINIMAX_KEY && !isClinicalQuery(text)) ? 'minimax' : (ANTHROPIC_KEY ? 'anthropic' : 'gateway'),
+        responseLength: (response || '').length,
+        deflected: (response || '').indexOf('I cannot') >= 0 || (response || '').indexOf('contact your doctor') >= 0,
+        correlationId: correlationId,
+      });
 
     // 9. Audit: response delivered (G1)
     persistConversationData(chatId, entityId, text, response, tenant);
@@ -1712,7 +1715,7 @@ function callGateway(question, tenantId, expertSlug) {
     var data = JSON.stringify(payload);
     var url = new URL('/api/gateway/ask_wellness_question', MOTHERSHIP);
     var req = https.request(url, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MCP-API-Key': (typeof tenant !== 'undefined' && tenant ? getMcpKey(tenant.tenantId) : MCP_KEY) },
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MCP-API-Key': MCP_KEY },
       timeout: GATEWAY_TIMEOUT,
     }, function(res) {
       var c = ''; res.on('data', function(d) { c += d; });
@@ -1735,11 +1738,26 @@ var offset = 0;
 async function poll() {
   while (true) {
     try {
-      var r = await tgApi('getUpdates', { offset: offset, timeout: POLL_TIMEOUT, allowed_updates: ['message'] });
+      var r = await tgApi('getUpdates', { offset: offset, timeout: POLL_TIMEOUT, allowed_updates: ['message', 'message_reaction'] });
       if (r.ok && r.result) {
         for (var i = 0; i < r.result.length; i++) {
           offset = r.result[i].update_id + 1;
           if (r.result[i].message) handleMessage(r.result[i].message).catch(function(e) { console.error('[nc] Handler:', e.message); });
+          // Handle reactions (HACPO feedback loop)
+          if (r.result[i].message_reaction) {
+            var reaction = r.result[i].message_reaction;
+            var reactChatId = reaction.chat.id;
+            var reactTenant = CHAT_TENANT_MAP[String(reactChatId)];
+            if (reactTenant) {
+              var emojiList = (reaction.new_reaction || []).map(function(r) { return r.emoji || r.custom_emoji_id || '?'; });
+              var sentiment = emojiList.some(function(e) { return ['❤️','👍','🔥','💯','👏'].indexOf(e) >= 0; }) ? 'positive' :
+                              emojiList.some(function(e) { return ['👎','😡','💩'].indexOf(e) >= 0; }) ? 'negative' : 'neutral';
+              emitAudit('telegram.reaction', {
+                chatId: reactChatId, tenantId: reactTenant.tenantId,
+                messageId: reaction.message_id, emoji: emojiList.join(','), sentiment: sentiment,
+              });
+            }
+          }
         }
       }
     } catch (e) {
@@ -1761,24 +1779,22 @@ http.createServer(function(req, res) {
   }
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
-    status: 'ok', agent: 'nanoclaw-v11-esagm', messages: msgCount,
+    status: 'ok', agent: 'nanoclaw-v11.3.0', messages: msgCount,
     uptime: Math.round(process.uptime()),
     memory: { type: 'ESAGM', entities: Object.keys(entities).length }, // SEC-07: no patient names in health
     capabilities: ANTHROPIC_KEY ? 'tool_use+esagm' : 'gateway_only',
   }));
 }).listen(HEALTH_PORT, '127.0.0.1'); // SEC-07: localhost only
-healthServer = this; // S2: reference for graceful shutdown
 
-console.log('[nc] NanoClaw ' + NANOCLAW_VERSION + ' ESAGM on :' + HEALTH_PORT);
+console.log('[nc] NanoClaw v11.3.0 on :' + HEALTH_PORT);
 console.log('[nc] Persona: COS (admin) + Expert Rep (Keith Koo)');
 console.log('[nc] Memory: Entity-Scoped Attention Graph (per-patient isolation)');
 console.log('[nc] Tools: ' + (ANTHROPIC_KEY ? 'Anthropic tool_use (scoped by persona)' : 'Gateway only (no ANTHROPIC_KEY)'));
 console.log('[nc] Audit: agent_event_bus + correlation IDs');
-console.log('[nc] Version: ' + NANOCLAW_VERSION + ' | Tools: ' + ALL_TOOLS.length);
 loadAgentIdentity().catch(function(e) { console.warn('[nc] Initial identity load failed:', e.message); });
-discoverTools().catch(function(e) { console.warn('[nc] Tool discovery failed:', e.message); });
+seedBrandDNA(); // Seed DR MAGfield brand DNA into agent memory
 
 // Startup audit event
-emitAudit('nanoclaw.startup', { version: NANOCLAW_VERSION, capabilities: ANTHROPIC_KEY ? 'full' : 'gateway_only' });
+emitAudit('nanoclaw.startup', { version: 'v11.3.0', capabilities: ANTHROPIC_KEY ? 'full' : 'gateway_only' });
 
 poll();
