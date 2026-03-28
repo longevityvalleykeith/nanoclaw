@@ -326,7 +326,7 @@ function switchEntity(chatId, newEntityId) {
 
 function addEntityTurn(chatId, entityId, role, content) {
   var entity = getEntity(chatId, entityId);
-  entity.turns.push({ role: role, content: content.slice(0, 600), ts: Date.now() });
+  entity.turns.push({ role: role, content: content.slice(0, 3000), ts: Date.now() });
   if (entity.turns.length > 10) entity.turns = entity.turns.slice(-8);
   getChat(chatId).global.totalTurns++;
 }
@@ -1029,7 +1029,7 @@ function saveSessionTurn(chatId, entityId, tenantId, role, content) {
   emitAudit('session.turn', {
     chatId: String(chatId), entityId: entityId,
     tenantId: tenantId, role: role,
-    content: (content || '').slice(0, 600),
+    content: (content || '').slice(0, 3000),
   });
 }
 
@@ -1420,7 +1420,7 @@ async function handleMessage(msg) {
 
       // Step 6: Store in entity memory for follow-up context
       addEntityTurn(chatId, entityId || 'system:admin', 'user', '[' + mediaType + '] ' + (caption || 'File uploaded'));
-      addEntityTurn(chatId, entityId || 'system:admin', 'assistant', geminiText.slice(0, 600));
+      addEntityTurn(chatId, entityId || 'system:admin', 'assistant', geminiText.slice(0, 3000));
 
       emitAudit('nanoclaw.media_processed', {
         chatId: chatId, mediaType: mediaType, mimeType: mimeType,
