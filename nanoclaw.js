@@ -101,6 +101,7 @@ function sendTelegram(chatId, text) {
   if (!clean) clean = 'How can I help?';
   var truncated = clean.length > 4000 ? clean.slice(0, 3997) + '...' : clean;
   return tgApi('sendMessage', { chat_id: chatId, text: truncated, parse_mode: 'Markdown' })
+    .then(function(r) { if (r && r.ok) { try { emitAudit('delivery.confirmed', { chatId: String(chatId), chars: truncated.length }); } catch(e) {} } return r; })
     .catch(function() { return tgApi('sendMessage', { chat_id: chatId, text: truncated }); });
 }
 
@@ -519,18 +520,6 @@ function resolveEntity(text, chat, tenant) {
     if (lower.includes(pname)) return knownPatients2[pname];
   }
 
-  // 3c. Dynamic patient resolution from patientNameCache (covers ALL registered patients)
-  for (var _pid in patientNameCache) {
-    var _pname = patientNameCache[_pid].toLowerCase();
-    var _parts = _pname.split(/[\s()]+/).filter(function(p) { return p.length >= 3; });
-    for (var _pp = 0; _pp < _parts.length; _pp++) {
-      if (_parts[_pp].length >= 4 && lower.includes(_parts[_pp])) {
-        var _slug = _pname.replace(/[\s()]+/g, '-').replace(/[^a-z0-9-]/g, '');
-        return 'patient:' + _slug;
-      }
-    }
-  }
-
   // 4. Pronoun resolution → most recent patient (with gender matching)
   if (/\b(her|his|she|he|the patient|this patient|for her|for him)\b/i.test(lower)) {
     var isFemale = /\b(her|she)\b/i.test(lower);
@@ -633,6 +622,11 @@ var ALL_TOOLS = [
   { name: 'generate_i2v', description: 'Generate image-to-video via MiniMax Hailuo. Submit job and return task_id. Poll for completion separately.', input_schema: { type: 'object', properties: { image_url: { type: 'string', description: 'Public URL of image (required)' }, prompt: { type: 'string', description: 'Video prompt description (max 2000 chars)' }, duration: { type: 'number', description: 'Duration 6 or 10 seconds (default: 6)' } }, required: ['image_url'] } },
   { name: 'poll_i2v', description: 'Poll I2V task status and return video file_id when complete.', input_schema: { type: 'object', properties: { task_id: { type: 'string', description: 'I2V task_id from generate_i2v' } }, required: ['task_id'] } },
   { name: 'set_user_preference', description: 'Record user preference for response format (voice/video/text). Auto-detected from phrasing but can be set explicitly.', input_schema: { type: 'object', properties: { format: { type: 'string', description: 'Response format: voice, video, or text' }, voice_id: { type: 'string', description: 'Preferred voice_id for TTS (optional)' } }, required: ['format'] } },
+  { name: 'design_feedback', description: 'Submit design feedback for landing page / kiosk / PWA improvement. Tenant admin sends UI/UX feedback that feeds into the Stitch MCP design loop on Mac Mini. Use when admin says "the page looks wrong" or "change the color" or "improve the layout".', input_schema: { type: 'object', properties: { surface: { type: 'string', enum: ['landing', 'kiosk', 'pwa', 'mothership'], description: 'Which surface to improve' }, feedback: { type: 'string', description: 'What to change (colors, layout, copy, images, etc.)' }, priority: { type: 'string', enum: ['low', 'medium', 'high'], description: 'How urgent' } }, required: ['surface', 'feedback'] } },
+  { name: 'generate_content', description: 'Generate branded content for Telegram/Kiosk/Social. Creates product showcase, event promo, or health tip using brand DNA. Returns content atom with HTML.', input_schema: { type: 'object', properties: { type: { type: 'string', enum: ['product-showcase', 'promo-offer', 'health-tip', 'event-promo', 'testimonial'], description: 'Content type' }, headline: { type: 'string', description: 'Main headline' }, body: { type: 'string', description: 'Body copy' }, cta: { type: 'string', description: 'CTA text' }, product: { type: 'string', description: 'Product name' }, eventName: { type: 'string', description: 'Event name' }, eventDate: { type: 'string', description: 'Event date' } }, required: ['type', 'headline'] } },
+  { name: 'broadcast', description: 'Send approved content to Telegram GROUP and/or Kiosk. Admin-only. Use after approving generated content.', input_schema: { type: 'object', properties: { message: { type: 'string', description: 'Message to broadcast' }, mediaUrl: { type: 'string', description: 'Image/video URL to attach' }, mediaType: { type: 'string', enum: ['photo', 'video', 'animation'], description: 'Media type' } }, required: ['message'] } },
+  { name: 'event_campaign', description: 'Create content campaign for a KRPM golf event. Generates schedule: T-7 hype, T-1 reminder, T-0 event day, T+1 recap. Admin-only.', input_schema: { type: 'object', properties: { name: { type: 'string', description: 'Event name' }, date: { type: 'string', description: 'Event date YYYY-MM-DD' }, offer: { type: 'string', description: 'Special offer' } }, required: ['name', 'date'] } },
+  { name: 'render_video', description: 'Render Content Atom as MP4 video using Remotion (local Mac Mini, no API timeout). Returns video file path.', input_schema: { type: 'object', properties: { headline: { type: 'string', description: 'Video headline' }, body: { type: 'string', description: 'Body text' }, cta: { type: 'string', description: 'CTA text' }, type: { type: 'string', description: 'Content type' }, product: { type: 'string', description: 'Product name' }, eventName: { type: 'string', description: 'Event name' }, eventDate: { type: 'string', description: 'Event date' } }, required: ['headline'] } },
 ];
 
 // Scope by persona
@@ -647,7 +641,7 @@ function sanitize(str) {
 
 async function executeToolCall(toolName, input, tenant, correlationId) {
   // SEC-06: Validate tool name against allowlist
-  var allowedTools = ['query_knowledge', 'get_patient_roster', 'create_patient', 'start_intake', 'ask_wellness_question', 'get_synthesized_capsule', 'task_mirror', 'verify_response', 'send_to_group', 'schedule_followup', 'list_scheduled_tasks', 'create_checkout_link', 'voice_response', 'verify_url', 'generate_tts', 'generate_i2v', 'poll_i2v', 'set_user_preference'];
+  var allowedTools = ['query_knowledge', 'get_patient_roster', 'create_patient', 'start_intake', 'ask_wellness_question', 'get_synthesized_capsule', 'task_mirror', 'verify_response', 'send_to_group', 'schedule_followup', 'list_scheduled_tasks', 'create_checkout_link', 'voice_response', 'verify_url', 'generate_tts', 'generate_i2v', 'poll_i2v', 'set_user_preference', 'design_feedback', 'generate_content', 'broadcast', 'event_campaign', 'render_video'];
   if (allowedTools.indexOf(toolName) === -1) {
     return Promise.resolve({ error: 'Tool not in allowlist: ' + toolName });
   }
@@ -683,9 +677,13 @@ async function executeToolCall(toolName, input, tenant, correlationId) {
       }, 30000);
 
     case 'ask_wellness_question':
+      // B-4: Pass expertSlug + sessionId so Mothership creates a flywheel session
       return httpsPost(MOTHERSHIP + '/api/gateway/ask_wellness_question', gwHeaders, {
         question: input.question,
-        context: { tenantId: tenant.tenantId, domain: 'wellness' },
+        expertSlug: tenant.expertSlug,
+        tenantId: tenant.tenantId,
+        sessionId: correlationId,
+        context: { tenantId: tenant.tenantId, domain: 'wellness', source: 'nanoclaw-agent0' },
       }, GATEWAY_TIMEOUT);
 
     case 'get_synthesized_capsule':
@@ -805,7 +803,84 @@ async function executeToolCall(toolName, input, tenant, correlationId) {
       }
       return { verified: false, message: 'Link check failed: ' + (verifyResult ? verifyResult.error || 'HTTP ' + verifyResult.status : 'no response') };
     }
-default:
+    case 'design_feedback': {
+      // C: Proxy design feedback to agent_event_bus → Mac Mini Stitch MCP loop consumes it
+      var feedbackId = 'df_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+      emitAudit('design.feedback', {
+        feedbackId: feedbackId,
+        surface: input.surface || 'landing',
+        feedback: input.feedback || '',
+        priority: input.priority || 'medium',
+        submittedBy: tenant.isAdmin ? 'admin' : 'patient',
+        chatId: chatId, tenantId: tenant.tenantId,
+      });
+      return { queued: true, feedbackId: feedbackId, message: 'Design feedback submitted for ' + (input.surface || 'landing') + '. The Stitch design loop will process it in the next iteration.' };
+    }
+
+    case 'generate_content': {
+      var contentId = 'ca_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+      var contentAtom = {
+        contentId: contentId, type: input.type || 'product-showcase',
+        brand: { name: EXPERT_NAME || 'DR MAGfield', tenantId: tenant.tenantId },
+        headline: input.headline || '', body: input.body || '',
+        cta: input.cta || 'Book Your Session',
+        product: input.product || '', eventName: input.eventName || '', eventDate: input.eventDate || '',
+        generatedAt: new Date().toISOString(),
+      };
+      emitAudit('content.generated', { contentId: contentId, type: input.type, headline: input.headline, tenantId: tenant.tenantId });
+      return contentAtom;
+    }
+
+    case 'broadcast': {
+      if (!tenant.isAdmin) return { error: 'Admin only' };
+      var groupChatId = null;
+      for (var bk in CHAT_TENANT_MAP) { if (CHAT_TENANT_MAP[bk] && CHAT_TENANT_MAP[bk].tenantId === tenant.tenantId && CHAT_TENANT_MAP[bk].isGroup) { groupChatId = bk; break; } }
+      if (!groupChatId) return { error: 'No group chat found for tenant' };
+      if (input.mediaUrl && input.mediaType) {
+        var bMethod = input.mediaType === 'video' ? 'sendVideo' : input.mediaType === 'animation' ? 'sendAnimation' : 'sendPhoto';
+        var bField = input.mediaType === 'video' ? 'video' : input.mediaType === 'animation' ? 'animation' : 'photo';
+        await tgApi(bMethod, { chat_id: groupChatId, [bField]: input.mediaUrl, caption: input.message, parse_mode: 'Markdown' });
+      } else {
+        await tgApi('sendMessage', { chat_id: groupChatId, text: input.message, parse_mode: 'Markdown' });
+      }
+      emitAudit('content.broadcast', { tenantId: tenant.tenantId, hasMedia: !!input.mediaUrl, mediaType: input.mediaType });
+      return { sent: true, target: 'telegram-group', chatId: groupChatId };
+    }
+
+    case 'event_campaign': {
+      if (!tenant.isAdmin) return { error: 'Admin only' };
+      var evtDate = new Date(input.date);
+      var evtNow = new Date();
+      var daysUntil = Math.ceil((evtDate - evtNow) / 86400000);
+      var schedule = [];
+      if (daysUntil > 7) schedule.push({ daysBefore: 7, label: 'Pre-event hype' });
+      if (daysUntil > 1) schedule.push({ daysBefore: 1, label: 'Reminder + offer' });
+      schedule.push({ daysBefore: 0, label: 'Event day kiosk' });
+      schedule.push({ daysBefore: -1, label: 'Recap CTA' });
+      var campaignId = 'evt_' + Date.now();
+      emitAudit('campaign.created', { campaignId: campaignId, eventName: input.name, eventDate: input.date, offer: input.offer || '', schedule: schedule, tenantId: tenant.tenantId });
+      return { campaignId: campaignId, event: input.name, date: input.date, daysUntil: daysUntil, schedule: schedule, message: schedule.length + ' content pieces scheduled for ' + input.name };
+    }
+
+    case 'render_video': {
+      var renderProps = JSON.stringify({
+        brandName: EXPERT_NAME || 'DR MAGfield',
+        headline: input.headline || '', body: input.body || '',
+        cta: input.cta || 'Book Your Session',
+        product: input.product || '', eventName: input.eventName || '', eventDate: input.eventDate || '',
+        primaryColor: '#2D3748', accentColor: '#C9A96E', bgColor: '#FFFDF9',
+      });
+      var outputPath = '/tmp/content-atom-' + Date.now() + '.mp4';
+      var remotionDir = process.env.REMOTION_DIR || (require('os').homedir() + '/lv-agent/remotion-studio');
+      try {
+        var { execSync } = require('child_process');
+        execSync('cd ' + remotionDir + " && npx remotion render ContentAtom --props='" + renderProps + "' " + outputPath, { timeout: 120000, stdio: 'pipe' });
+        emitAudit('content.rendered', { type: 'remotion-mp4', outputPath: outputPath, headline: input.headline, tenantId: tenant.tenantId });
+        return { rendered: true, outputPath: outputPath };
+      } catch (re) { return { error: 'Render failed: ' + (re.message || '').slice(0, 100) }; }
+    }
+
+    default:
       return Promise.resolve({ error: 'Unknown tool: ' + toolName });
   }
 }
@@ -871,6 +946,11 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
   }
 
   // BEHAVIORAL RULES (6 core — ML-172: hard gates handle safety, not prompt rules)
+  // Trust Layer 2: Competence — cite protocols
+  sys += "TRUST PROTOCOL CITATION: When answering clinical questions, ALWAYS cite the specific protocol:\n";
+  sys += "- Format: \"Based on Protocol [rule_title] (verified by " + (tenant.expertName || EXPERT_NAME) + ")\"\n";
+  sys += "- Show confidence: \"Confidence: [X]%\" when from ask_wellness_question\n";
+  sys += "- If confidence < 50%: \"This needs expert review. Flagging for " + (tenant.expertName || EXPERT_NAME) + ".\"\n\n";
   sys += "Rules:\n";
   sys += "- SELF-MODEL: NEVER say Done/Sent/Notified unless a tool call returned SUCCESS. If you did not call a tool, you did NOT do it.\n";
   sys += "- SELF-MODEL: Before claiming you reached someone, verify you have their chat_id. If not, say so.\n";
@@ -882,14 +962,6 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
   sys += "- send_to_group = GROUP (everyone sees). schedule_followup = queued (needs patient DM).\n";
   if (isGroup) sys += "- GROUP: Never mention other patients. Never list names. PHI queries = redirect to DM.\n";
   sys += "\n";
-  // SHARED MEDIA CONTEXT: Include last Gemini analysis regardless of entity
-  var chatGlobal = getChat(chatId).global || {};
-  if (chatGlobal.lastMediaAnalysis && (Date.now() - chatGlobal.lastMediaAnalysis.timestamp) < 30 * 60 * 1000) {
-    sys += '\nLAST DOCUMENT ANALYSIS (from ' + chatGlobal.lastMediaAnalysis.fileName + ', ' + Math.round((Date.now() - chatGlobal.lastMediaAnalysis.timestamp) / 60000) + ' min ago):\n';
-    sys += chatGlobal.lastMediaAnalysis.content.slice(0, 2000) + '\n';
-    sys += 'YOU ALREADY HAVE THIS DATA. Do NOT ask the user to resend it.\n\n';
-  }
-
   if (entity.anchor) sys += 'Context: ' + entity.anchor + '\n';
   if (entity.digest) sys += 'Recent: ' + entity.digest + '\n';
 
@@ -1062,7 +1134,7 @@ async function loadSessionMemory(chatId, tenantId) {
 
 function saveSessionTurn(chatId, entityId, tenantId, role, content) {
   emitAudit('session.turn', {
-    chatId: String(chatId), entityId: entityId,
+    chatId: String(chatId), entityId: entityId, channel: 'telegram', sender_id: String(chatId), intent: null,
     tenantId: tenantId, role: role,
     content: (content || '').slice(0, 600),
   });
@@ -1495,21 +1567,7 @@ async function handleMessage(msg) {
 
         // Step 6: Store in entity memory for follow-up context
         addEntityTurn(chatId, entityId || 'system:admin', 'user', '[' + mediaType + '] ' + (caption || 'File uploaded'));
-        addEntityTurn(chatId, entityId || 'system:admin', 'assistant', geminiText.slice(0, 3000));
-
-        // CRITICAL: Store in chat-level shared context so ALL entities can see it
-        var chatObj = getChat(chatId);
-        chatObj.global = chatObj.global || {};
-        // Extract patient name from Gemini analysis for Wire 4 patient matching
-        var _patientNameMatch = geminiText.match(/(?:Patient|Name).*?:\s*([A-Z][A-Za-z\s]+?)(?:\n|,|\()/);
-        chatObj.global.lastMediaAnalysis = {
-          content: geminiText.slice(0, 3000),
-          mediaType: mediaType,
-          fileName: (msg.document && msg.document.file_name) || 'uploaded_file',
-          patientName: _patientNameMatch ? _patientNameMatch[1].trim() : null,
-          timestamp: Date.now(),
-        };
-        console.log('[nc] Media analysis stored in chat global context (' + geminiText.length + ' chars retained)');
+        addEntityTurn(chatId, entityId || 'system:admin', 'assistant', geminiText.slice(0, 600));
 
         emitAudit('nanoclaw.media_processed', {
           chatId: chatId, mediaType: mediaType, mimeType: mimeType,
@@ -1522,7 +1580,31 @@ async function handleMessage(msg) {
       return;
     }
   }
-  if (!text || text === '/start') return;
+  // FEATURE 1: Auto-intake on /start (Trust Layer 1: Recognition)
+  if (text === '/start' || text === '/start@' + (process.env.TELEGRAM_BOT_USERNAME || '')) {
+    var tenant = CHAT_TENANT_MAP[String(chatId)];
+    if (!tenant) {
+      await sendTelegram(chatId, 'Welcome! Please contact the practice admin to get set up.');
+      return;
+    }
+    var expertName = tenant.expertName || EXPERT_NAME;
+    var rulesCount = 0;
+    try {
+      var r = await httpsGet(MOTHERSHIP + '/api/agent/consciousness?tenantId=' + tenant.tenantId, { 'X-MCP-API-Key': getMcpKey(tenant.tenantId) }, 5000).catch(function() { return null; });
+      if (r && r.practiceScope) rulesCount = r.practiceScope.rules || 0;
+    } catch(e) {}
+    // Trust Layer 3: Authority — credential banner on first contact
+    await sendTelegram(chatId,
+      'Welcome! I am the AI health assistant for ' + expertName + '.\n\n' +
+      (rulesCount > 0 ? 'I am trained on ' + rulesCount + ' clinical protocols verified by ' + expertName + '.\n\n' : '') +
+      'To get started, could you share your name? I will set up your profile so we can provide personalized care.\n\n' +
+      'All clinical recommendations are reviewed by ' + expertName + '.'
+    );
+    // Emit acquisition.start event (P1 fix)
+    emitAudit('acquisition.start', { chatId: String(chatId), channel: 'telegram', tenantId: tenant.tenantId, source: 'start_command' });
+    return;
+  }
+  if (!text) return;
 
   // SEC-02: Rate limiting — max 10 msgs/min per chat
   var rateKey = 'rate:' + chatId;
@@ -1655,31 +1737,8 @@ async function handleMessage(msg) {
     }).join('\n');
     systemPrompt += '\n\nConversation history for this entity:\n' + historyText;
   }
-  // Wire 4: Patient-aware media context bridge (SAFETY: must match patient being discussed)
-  var _chatGlobal = getChat(chatId).global || {};
-  var _recentMedia = _chatGlobal.lastMediaAnalysis;
-  var _mediaContext = '';
-  if (_recentMedia && (Date.now() - _recentMedia.timestamp) < 30 * 60 * 1000) {
-    // Extract patient name from the analysis
-    var _analysisPatient = (_recentMedia.content.match(/Patient.*?:\s*([A-Z][A-Z\s]+)/i) || [])[1] || '';
-    // Check if the user's message references the SAME patient OR uses generic reference
-    var _textLower = text.toLowerCase();
-    var _apLower = _analysisPatient ? _analysisPatient.toLowerCase() : '';
-    var _apParts = _apLower.split(/\s+/).filter(function(p) { return p.length >= 3; });
-    var _patientMatch = _apParts.some(function(p) { return _textLower.includes(p); });
-    var _genericRef = /\b(the report|this report|that report|the analysis|blood test|lab report|her report|his report)\b/i.test(text);
-    // ONLY inject if patient matches OR user explicitly references "the report"
-    if (_patientMatch || _genericRef) {
-      _mediaContext = '[Lab report for ' + (_analysisPatient || 'unknown patient') + ':\n' + _recentMedia.content.slice(0, 1500) + ']\n\nIMPORTANT: This data belongs to ' + (_analysisPatient || 'the patient above') + '. Do NOT apply it to a different patient.\n\nUser request: ';
-      console.log('[nc] Wire 4: injected media for patient ' + _analysisPatient + ' (' + _recentMedia.content.length + ' chars)');
-    } else if (/\b(verify|check|analyse|analyze|safe|prescription|re.?analy)\b/i.test(text)) {
-      // User asking clinical question but patient might not match — warn
-      _mediaContext = '[NOTE: The last analyzed report was for ' + (_analysisPatient || 'a different patient') + '. Make sure you are answering about the CORRECT patient the user is asking about. If unsure, ASK which patient they mean.]\n\nUser request: ';
-      console.log('[nc] Wire 4: patient mismatch warning injected');
-    }
-  }
   // ONLY the current user message goes in messages array — clean for tool_use
-  var contextMessages = [{ role: 'user', content: _mediaContext + text }];
+  var contextMessages = [{ role: 'user', content: text }];
 
   try {
     var response;
@@ -1720,13 +1779,6 @@ async function handleMessage(msg) {
     await sendTelegram(chatId, response);
     console.log('[nc] Delivered (' + response.length + ' chars) entity=' + entityId);
 
-      // Wire 2: Typed patient events for entity graph sync
-      if (toolName === 'create_patient' && toolResult && !toolResult.error) {
-        emitAudit('patient.registered', { patient_id: toolResult.patientId || null, tool: toolName, correlationId: correlationId, tenantId: tenant.tenantId });
-      }
-      if (toolName === 'ask_wellness_question' && toolResult && !toolResult.error) {
-        emitAudit('patient.clinical_verified', { tool: toolName, correlationId: correlationId, tenantId: tenant.tenantId });
-      }
       // HACPO experience report (non-blocking)
       emitAudit('agent.experience.report', {
         tenantId: tenant.tenantId, chatId: chatId, entityId: entityId,
@@ -1745,16 +1797,15 @@ async function handleMessage(msg) {
 
   } catch (e) {
     clearInterval(typingInterval);
-    console.error('[nc] Error:', e.message);
-    // B-1 FIX: Log error + emit audit (previously swallowed)
-    var errMsg = error instanceof Error ? error.message : String(error);
-    console.error('[nc] RESPONSE ERROR for chatId=' + chatId + ': ' + errMsg);
+    var errMsg = e instanceof Error ? e.message : String(e);
+    console.error('[nc] RESPONSE ERROR chatId=' + chatId + ' entity=' + entityId + ': ' + errMsg);
+    // B-1: Audit the error (previously swallowed — invisible to HACPO/Oracle)
     emitAudit('agent.error', {
-      chatId: chatId, error: errMsg.slice(0, 200),
-      entityId: entityId, persona: persona,
-      correlationId: correlationId, tenantId: tenant.tenantId,
+      chatId: chatId, tenantId: tenant ? tenant.tenantId : null,
+      entityId: entityId, error: errMsg, correlationId: correlationId,
+      provider: typeof primaryProvider !== 'undefined' ? primaryProvider : 'unknown',
     });
-    await sendTelegram(chatId, 'Processing error: ' + (errMsg.includes('429') ? 'Rate limited — retrying shortly.' : 'Please try again.')).catch(function() {});
+    await sendTelegram(chatId, 'Processing error. Please try again.').catch(function() {});
   }
 }
 
@@ -1839,6 +1890,37 @@ http.createServer(function(req, res) {
   }));
 }).listen(HEALTH_PORT, '127.0.0.1'); // SEC-07: localhost only
 
+// FM-5: Kiosk API proxy on Tailscale — exposes read-only endpoints for kiosk/widget surfaces
+// Binds to 0.0.0.0 on a separate port (3100) — Tailscale ACL restricts access
+var KIOSK_PORT = process.env.KIOSK_PORT || 3100;
+http.createServer(function(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+  if (req.url === '/health' || req.url === '/') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', agent: 'nanoclaw-v11.3.0-kiosk', tools: ALL_TOOLS.length }));
+    return;
+  }
+
+  // /api/banner — returns latest content.generated event for kiosk display
+  if (req.url && req.url.startsWith('/api/banner')) {
+    if (!SUPABASE_URL || !SUPABASE_KEY) { res.writeHead(503); res.end('{}'); return; }
+    httpsGet(SUPABASE_URL + '/rest/v1/agent_event_bus?event_type=eq.content.broadcast&tenant_id=eq.' + TENANT_ID + '&order=created_at.desc&limit=1&select=payload',
+      { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }, 5000)
+      .then(function(data) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(Array.isArray(data) && data[0] ? data[0].payload : {}));
+      }).catch(function() { res.writeHead(200); res.end('{}'); });
+    return;
+  }
+
+  res.writeHead(404); res.end('{"error":"not found"}');
+}).listen(KIOSK_PORT, '0.0.0.0');
+console.log('[nc] Kiosk API on :' + KIOSK_PORT + ' (Tailscale-accessible)');
+
 console.log('[nc] NanoClaw v11.3.0 on :' + HEALTH_PORT);
 console.log('[nc] Persona: COS (admin) + Expert Rep (Keith Koo)');
 console.log('[nc] Memory: Entity-Scoped Attention Graph (per-patient isolation)');
@@ -1848,6 +1930,6 @@ loadAgentIdentity().catch(function(e) { console.warn('[nc] Initial identity load
 seedBrandDNA(); // Seed DR MAGfield brand DNA into agent memory
 
 // Startup audit event
-emitAudit('nanoclaw.startup', { version: 'v11.3.0', capabilities: ANTHROPIC_KEY ? 'full' : 'gateway_only' });
+emitAudit('nanoclaw.startup', { version: 'v11.3.0', capabilities: ANTHROPIC_KEY ? 'full' : 'gateway_only', tenantId: TENANT_ID, tenantMode: process.env.TENANT_MODE || 'single', toolCount: ALL_TOOLS.length });
 
 poll();
