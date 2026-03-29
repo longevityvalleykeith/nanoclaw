@@ -1338,11 +1338,23 @@ async function loadAgentIdentity() {
     }
     console.log('[nc] Loaded ' + Object.keys(patientNameCache).length + ' patient names');
     // Dynamic admin chat loading — resolve from agents table
-    var adminUrl = SUPABASE_URL + '/rest/v1/agents?tenant_id=eq.' + TENANT_ID + '&agent_type=eq.chief_of_staff&select=gateway_config&limit=1';
+    var adminUrl = SUPABASE_URL + '/rest/v1/agents?agent_type=eq.chief_of_staff&select=gateway_config,tenant_id,name&limit=20';
     var adminAgent = await httpsGet(adminUrl, { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }, 5000).catch(function() { return []; });
     if (adminAgent && adminAgent[0] && adminAgent[0].gateway_config && adminAgent[0].gateway_config.telegram) {
       var tgConfig = adminAgent[0].gateway_config.telegram;
-      if (tgConfig.adminChatId && !CHAT_TENANT_MAP[String(tgConfig.adminChatId)]) {
+      // Multi-tenant admin iteration — load ALL agents' admin chats
+      if (adminAgent && adminAgent.length > 0) {
+        for (var _ai = 0; _ai < adminAgent.length; _ai++) {
+          var _ag = adminAgent[_ai];
+          if (_ag && _ag.gateway_config && _ag.gateway_config.telegram && _ag.gateway_config.telegram.adminChatId) {
+            var _adminChat = String(_ag.gateway_config.telegram.adminChatId);
+            if (!CHAT_TENANT_MAP[_adminChat]) {
+              CHAT_TENANT_MAP[_adminChat] = { tenantId: _ag.tenant_id || TENANT_ID, expertSlug: EXPERT_SLUG, expertName: _ag.name || EXPERT_NAME, isAdmin: true };
+              console.log('[nc] Admin chat registered: ' + _adminChat + ' → ' + (_ag.name || 'default'));
+            }
+          }
+        }
+      } else if (tgConfig.adminChatId && !CHAT_TENANT_MAP[String(tgConfig.adminChatId)]) {
         CHAT_TENANT_MAP[String(tgConfig.adminChatId)] = { tenantId: TENANT_ID, expertSlug: EXPERT_SLUG, expertName: EXPERT_NAME, isAdmin: true };
         console.log('[nc] Admin chat registered: ' + tgConfig.adminChatId);
       }
@@ -1367,18 +1379,25 @@ async function loadAgentIdentity() {
       if (consciousnessLessons.length > 0) console.log('[nc] Loaded ' + consciousnessLessons.length + ' behavioral lessons');
     }
     // Dynamic group chat registration — loads groupChatIds from agents.gateway_config
-    var agentGwUrl = SUPABASE_URL + '/rest/v1/agents?tenant_id=eq.' + TENANT_ID + '&agent_type=eq.chief_of_staff&select=gateway_config&limit=1';
+    var agentGwUrl = SUPABASE_URL + '/rest/v1/agents?agent_type=eq.chief_of_staff&select=gateway_config,tenant_id,name&limit=20';
     var agentGw = await httpsGet(agentGwUrl, { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }, 5000).catch(function() { return []; });
-    if (agentGw && agentGw[0] && agentGw[0].gateway_config && agentGw[0].gateway_config.telegram) {
-      var gids = agentGw[0].gateway_config.telegram.groupChatIds || [];
+    if (agentGw && agentGw.length > 0) {
       var newGroups = 0;
-      for (var gid of gids) {
-        if (!CHAT_TENANT_MAP[String(gid)]) {
-          CHAT_TENANT_MAP[String(gid)] = { tenantId: TENANT_ID, expertSlug: EXPERT_SLUG, expertName: EXPERT_NAME, isAdmin: false, isGroup: true };
-          newGroups++;
+      for (var gi = 0; gi < agentGw.length; gi++) {
+        var gAgent = agentGw[gi];
+        if (gAgent && gAgent.gateway_config && gAgent.gateway_config.telegram) {
+          var gids = gAgent.gateway_config.telegram.groupChatIds || [];
+          var gTenantId = gAgent.tenant_id || TENANT_ID;
+          var gName = gAgent.name || EXPERT_NAME;
+          for (var gid of gids) {
+            if (!CHAT_TENANT_MAP[String(gid)]) {
+              CHAT_TENANT_MAP[String(gid)] = { tenantId: gTenantId, expertSlug: EXPERT_SLUG, expertName: gName, isAdmin: false, isGroup: true };
+              newGroups++;
+            }
+          }
         }
       }
-      if (newGroups > 0) console.log('[nc] Registered ' + newGroups + ' new group chat(s) from DB');
+      if (newGroups > 0) console.log('[nc] Registered ' + newGroups + ' group chat(s) from ' + agentGw.length + ' agent(s)');
     }
   } catch (e) { console.warn('[nc] Identity load failed:', e.message || e); }
 }
