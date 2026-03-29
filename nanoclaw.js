@@ -23,6 +23,15 @@ const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const MOTHERSHIP = process.env.LV_BACKEND_URL || 'https://app.longevityvalley.ai';
 const MCP_KEY = process.env.MCP_API_KEY;
 if (!MCP_KEY) { console.error('[nc] FATAL: MCP_API_KEY not set'); process.exit(1); }
+
+// Per-tenant MCP key resolution (prevents cross-tenant data leak)
+var TENANT_MCP_KEYS = {
+  'abe1b946-6643-4acc-9cc1-6a47336d31d8': process.env.MCP_API_KEY_AMANI || MCP_KEY,
+  '3cc281be-aafc-4579-9edf-521659306145': process.env.MCP_API_KEY_MAGFIELD || MCP_KEY,
+  '0d18e819-36fa-40a9-9704-cea809a7c7ea': process.env.MCP_API_KEY_PINGCARE || MCP_KEY,
+  '313a6002-5718-4c28-8fe1-82f831b83cdf': MCP_KEY,
+};
+function getMcpKey(tenantId) { return TENANT_MCP_KEYS[tenantId] || MCP_KEY; }
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
 const MINIMAX_KEY = process.env.MINIMAX_API_KEY || '';
 const MINIMAX_TTS_KEY = process.env.MINIMAX_TTS_API_KEY || process.env.MINIMAX_API_KEY || '';
@@ -38,8 +47,60 @@ const EXPERT_NAME = process.env.EXPERT_NAME || 'Keith Koo';
 const EXPERT_SLUG = process.env.EXPERT_SLUG || 'keith-koo';
 const HEALTH_PORT = 3002;
 const GATEWAY_TIMEOUT = 120000;
+const NANOCLAW_VERSION = 'v11.3.0-safety'; // S1-S4 safety patched
 
 if (!TG_TOKEN) { console.error('[nc] FATAL: TELEGRAM_BOT_TOKEN not set'); process.exit(1); }
+
+// ============================================================================
+// S1: PROCESS CRASH RECOVERY
+// ============================================================================
+process.on('uncaughtException', function(err) {
+  console.error('[nc] UNCAUGHT EXCEPTION:', err.message, err.stack);
+  emitAudit('nanoclaw.crash', { type: 'uncaughtException', error: err.message });
+  setTimeout(function() { process.exit(1); }, 2000);
+});
+process.on('unhandledRejection', function(reason) {
+  console.error('[nc] UNHANDLED REJECTION:', reason);
+  emitAudit('nanoclaw.crash', { type: 'unhandledRejection', error: String(reason) });
+});
+
+// ============================================================================
+// S2: GRACEFUL SHUTDOWN
+// ============================================================================
+var healthServer = null;
+var isShuttingDown = false;
+function gracefulShutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log('[nc] ' + signal + ' received — graceful shutdown');
+  emitAudit('nanoclaw.shutdown', { signal: signal, version: NANOCLAW_VERSION });
+  if (healthServer) try { healthServer.close(); } catch(e) {}
+  setTimeout(function() { process.exit(0); }, 3000);
+}
+process.on('SIGTERM', function() { gracefulShutdown('SIGTERM'); });
+process.on('SIGINT', function() { gracefulShutdown('SIGINT'); });
+
+// ============================================================================
+// S3: CIRCUIT BREAKER ON MOTHERSHIP GATEWAY
+// ============================================================================
+var gatewayFailures = 0;
+var gatewayCircuitOpenUntil = 0;
+var GATEWAY_CB_THRESHOLD = 5;
+var GATEWAY_CB_COOLDOWN_MS = 60000;
+function isGatewayCircuitOpen() {
+  return Date.now() < gatewayCircuitOpenUntil;
+}
+function recordGatewaySuccess() {
+  gatewayFailures = 0;
+}
+function recordGatewayFailure() {
+  gatewayFailures++;
+  if (gatewayFailures >= GATEWAY_CB_THRESHOLD) {
+    gatewayCircuitOpenUntil = Date.now() + GATEWAY_CB_COOLDOWN_MS;
+    console.warn('[nc] Circuit breaker OPEN on Mothership gateway after ' + gatewayFailures + ' failures');
+    emitAudit('nanoclaw.circuit_open', { failures: gatewayFailures, cooldownMs: GATEWAY_CB_COOLDOWN_MS });
+  }
+}
 
 // ============================================================================
 // TENANT MAPPING
@@ -972,7 +1033,92 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
 // ============================================================================
 // MINIMAX M2.7 TOOL_USE (OpenAI-compatible format)
 // Used for non-clinical queries: admin tasks, scheduling, roster, group messages
-function callMiniMax(systemPrompt, messages, tools, tenant, correlationId) {
+// ============================================================================
+// S4: MODEL-AGNOSTIC LLM ROUTER
+// ============================================================================
+var LLM_PROVIDERS = {
+  minimax:   { available: !!MINIMAX_KEY,   name: 'MiniMax M2.7' },
+  anthropic: { available: !!ANTHROPIC_KEY, name: 'Anthropic Haiku 4.5' },
+  openai:    { available: !!(process.env.OPENAI_API_KEY), name: 'OpenAI' },
+  deepseek:  { available: !!(process.env.DEEPSEEK_API_KEY), name: 'DeepSeek' },
+  google:    { available: !!(process.env.GOOGLE_AI_API_KEY), name: 'Google Gemini' },
+};
+
+function callLLM(provider, systemPrompt, messages, tools, tenant, correlationId, chatId) {
+  if (isGatewayCircuitOpen()) {
+    console.warn('[nc] Circuit open — skipping LLM call to ' + provider);
+    return Promise.resolve(null);
+  }
+  switch (provider) {
+    case 'minimax':   return callMiniMax(systemPrompt, messages, tools, tenant, correlationId, chatId);
+    case 'anthropic': return callAnthropic(systemPrompt, messages, tools, tenant, correlationId, chatId);
+    case 'openai':    return callOpenAI(systemPrompt, messages, tools, tenant, correlationId, chatId);
+    case 'deepseek':  return callDeepSeek(systemPrompt, messages, tools, tenant, correlationId, chatId);
+    default:
+      console.warn('[nc] Unknown LLM provider: ' + provider + ', falling back to anthropic');
+      return callAnthropic(systemPrompt, messages, tools, tenant, correlationId, chatId);
+  }
+}
+
+function resolveLLMProvider(text) {
+  if (isClinicalQuery(text)) {
+    if (LLM_PROVIDERS.anthropic.available) return 'anthropic';
+    if (LLM_PROVIDERS.minimax.available) return 'minimax';
+    if (LLM_PROVIDERS.openai.available) return 'openai';
+  } else {
+    if (LLM_PROVIDERS.minimax.available) return 'minimax';
+    if (LLM_PROVIDERS.anthropic.available) return 'anthropic';
+    if (LLM_PROVIDERS.openai.available) return 'openai';
+    if (LLM_PROVIDERS.deepseek.available) return 'deepseek';
+  }
+  return 'anthropic';
+}
+
+function callOpenAI(systemPrompt, messages, tools, tenant, correlationId, chatId) {
+  return callOpenAICompatible('https://api.openai.com/v1/chat/completions', process.env.OPENAI_API_KEY || '', process.env.OPENAI_MODEL || 'gpt-4.1-mini', systemPrompt, messages, tools, tenant, correlationId, chatId);
+}
+
+function callDeepSeek(systemPrompt, messages, tools, tenant, correlationId, chatId) {
+  return callOpenAICompatible('https://api.deepseek.com/v1/chat/completions', process.env.DEEPSEEK_API_KEY || '', process.env.DEEPSEEK_MODEL || 'deepseek-chat', systemPrompt, messages, tools, tenant, correlationId, chatId);
+}
+
+function callOpenAICompatible(baseUrl, apiKey, model, systemPrompt, messages, tools, tenant, correlationId, chatId) {
+  var openaiTools = tools.map(function(t) {
+    return { type: 'function', function: { name: t.name, description: t.description, parameters: t.input_schema || { type: 'object', properties: {} } } };
+  });
+  var openaiMessages = [{ role: 'system', content: systemPrompt }];
+  for (var m of messages) { openaiMessages.push({ role: m.role, content: m.content }); }
+
+  function callOnce(msgs, round) {
+    return httpsPost(baseUrl, {
+      'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json',
+    }, {
+      model: model, messages: msgs,
+      tools: openaiTools.length > 0 ? openaiTools : undefined,
+      max_tokens: 4096, temperature: 0.7,
+    }, 45000).then(function(result) {
+      if (result.error) { console.error('[nc] ' + model + ' error:', JSON.stringify(result.error).slice(0, 150)); recordGatewayFailure(); return null; }
+      if (!result.choices || !result.choices[0]) { recordGatewayFailure(); return null; }
+      recordGatewaySuccess();
+      var message = result.choices[0].message;
+      if (message.tool_calls && message.tool_calls.length > 0 && round < 5) {
+        var toolPromises = message.tool_calls.map(function(tc) {
+          var input = {}; try { input = JSON.parse(tc.function.arguments); } catch(e) {}
+          return executeToolCall(tc.function.name, input, tenant, correlationId, chatId).then(function(toolResult) {
+            return { role: 'tool', tool_call_id: tc.id, content: JSON.stringify(toolResult).slice(0, 3000) };
+          });
+        });
+        return Promise.all(toolPromises).then(function(toolResults) {
+          return callOnce(msgs.concat([{ role: 'assistant', content: message.content || '', tool_calls: message.tool_calls }].concat(toolResults)), round + 1);
+        });
+      }
+      return (message.content || 'Done.').trim();
+    });
+  }
+  return callOnce(openaiMessages, 0);
+}
+
+function callMiniMax(systemPrompt, messages, tools, tenant, correlationId, chatId) {
   // Convert Anthropic tool format to OpenAI function format
   var openaiTools = tools.map(function(t) {
     return {
@@ -1004,9 +1150,11 @@ function callMiniMax(systemPrompt, messages, tools, tenant, correlationId) {
     }, 45000).then(function(result) {
       if (result.error) {
         console.error('[nc] MiniMax error:', JSON.stringify(result.error).slice(0, 150));
+        recordGatewayFailure();
         return null;
       }
-      if (!result.choices || !result.choices[0]) return null;
+      if (!result.choices || !result.choices[0]) { recordGatewayFailure(); return null; }
+      recordGatewaySuccess();
 
       var choice = result.choices[0];
       var message = choice.message;
@@ -1048,8 +1196,9 @@ function callAnthropic(systemPrompt, messages, tools, tenant, correlationId) {
       model: 'claude-haiku-4-5-20251001', max_tokens: 4096,
       system: systemPrompt, messages: msgs, tools: tools,
     }, 45000).then(function(result) {
-      if (result.error) { console.error('[nc] Anthropic:', JSON.stringify(result.error).slice(0, 150)); return null; }
-      if (!result.content) return null;
+      if (result.error) { console.error('[nc] Anthropic:', JSON.stringify(result.error).slice(0, 150)); recordGatewayFailure(); return null; }
+      if (!result.content) { recordGatewayFailure(); return null; }
+      recordGatewaySuccess();
 
       var toolBlocks = result.content.filter(function(b) { return b.type === 'tool_use'; });
       var textBlocks = result.content.filter(function(b) { return b.type === 'text'; });
@@ -1745,18 +1894,25 @@ async function handleMessage(msg) {
 
     if (MINIMAX_KEY && !isClinicalQuery(text)) {
       // NON-CLINICAL: MiniMax M2.7 (76% cheaper, admin/scheduling/roster)
-      response = await callMiniMax(systemPrompt, contextMessages, tools, tenant, correlationId);
-      if (!response && ANTHROPIC_KEY) {
-        // MiniMax failed — fallback to Anthropic
-        console.warn('[nc] MiniMax failed, falling back to Anthropic');
-        response = await callAnthropic(systemPrompt, contextMessages, tools, tenant, correlationId);
+      // S4: Use callLLM dispatcher for circuit breaker integration
+      var primaryProvider = resolveLLMProvider(text);
+      response = await callLLM(primaryProvider, systemPrompt, contextMessages, tools, tenant, correlationId, chatId);
+      if (!response) {
+        // Primary failed — try fallback providers
+        var fallbacks = ['anthropic', 'openai', 'deepseek'].filter(function(p) { return p !== primaryProvider; });
+        for (var fi = 0; fi < fallbacks.length; fi++) {
+          console.warn('[nc] ' + primaryProvider + ' failed, trying ' + fallbacks[fi]);
+          response = await callLLM(fallbacks[fi], systemPrompt, contextMessages, tools, tenant, correlationId, chatId);
+          if (response) break;
+        }
       }
     } else if (ANTHROPIC_KEY) {
       // CLINICAL: Anthropic Haiku (proven safety for health queries)
-      response = await callAnthropic(systemPrompt, contextMessages, tools, tenant, correlationId);
+      var clinicalProvider = resolveLLMProvider(text);
+      response = await callLLM(clinicalProvider, systemPrompt, contextMessages, tools, tenant, correlationId, chatId);
     } else if (MINIMAX_KEY) {
       // No Anthropic key — MiniMax for everything
-      response = await callMiniMax(systemPrompt, contextMessages, tools, tenant, correlationId);
+      response = await callLLM('minimax', systemPrompt, contextMessages, tools, tenant, correlationId, chatId);
     } else {
       // No LLM keys — gateway fallback
       response = await callGateway(text, tenant.tenantId, tenant.expertSlug);
@@ -1888,7 +2044,7 @@ http.createServer(function(req, res) {
     memory: { type: 'ESAGM', entities: Object.keys(entities).length }, // SEC-07: no patient names in health
     capabilities: ANTHROPIC_KEY ? 'tool_use+esagm' : 'gateway_only',
   }));
-}).listen(HEALTH_PORT, '127.0.0.1'); // SEC-07: localhost only
+}).listen(HEALTH_PORT, '127.0.0.1', function() { healthServer = this; }); // SEC-07: localhost only; S2: assign for graceful shutdown
 
 // FM-5: Kiosk API proxy on Tailscale — exposes read-only endpoints for kiosk/widget surfaces
 // Binds to 0.0.0.0 on a separate port (3100) — Tailscale ACL restricts access
