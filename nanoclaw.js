@@ -158,6 +158,17 @@ function tgApi(method, body) {
 }
 
 function sendTelegram(chatId, text) {
+  // OUTBOUND CONTENT GATE (Option B++) — blocks bad URLs, internal endpoints, API leaks
+  if (text && typeof text === 'string') {
+    var _blocked = ['manus.space','magfieldhub-prhmfwhg','localhost:','127.0.0.1','supabase.co/rest','api.anthropic.com','api.minimax.io'];
+    for (var _bp = 0; _bp < _blocked.length; _bp++) {
+      if (text.indexOf(_blocked[_bp]) >= 0) {
+        console.warn('[nc] GATE: blocked "' + _blocked[_bp] + '"');
+        text = text.split(_blocked[_bp]).join('[blocked]');
+        try { emitAudit('delivery.blocked', { chatId: String(chatId), pattern: _blocked[_bp] }); } catch(e) {}
+      }
+    }
+  }
   var clean = text.replace(/<think>[^]*?<\/think>/g, '').replace(/<\/?think>/g, '').replace(/<!-- .*? -->/g, '').trim();
   if (!clean) clean = 'How can I help?';
   var truncated = clean.length > 4000 ? clean.slice(0, 3997) + '...' : clean;
