@@ -1340,10 +1340,8 @@ async function loadAgentIdentity() {
     // Dynamic admin chat loading — resolve from agents table
     var adminUrl = SUPABASE_URL + '/rest/v1/agents?agent_type=eq.chief_of_staff&select=gateway_config,tenant_id,name&limit=20';
     var adminAgent = await httpsGet(adminUrl, { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }, 5000).catch(function() { return []; });
-    if (adminAgent && adminAgent[0] && adminAgent[0].gateway_config && adminAgent[0].gateway_config.telegram) {
-      var tgConfig = adminAgent[0].gateway_config.telegram;
-      // Multi-tenant admin iteration — load ALL agents' admin chats
-      if (adminAgent && adminAgent.length > 0) {
+    // Multi-tenant admin iteration — load ALL agents' admin chats
+    if (adminAgent && adminAgent.length > 0) {
         for (var _ai = 0; _ai < adminAgent.length; _ai++) {
           var _ag = adminAgent[_ai];
           if (_ag && _ag.gateway_config && _ag.gateway_config.telegram && _ag.gateway_config.telegram.adminChatId) {
@@ -1354,9 +1352,6 @@ async function loadAgentIdentity() {
             }
           }
         }
-      } else if (tgConfig.adminChatId && !CHAT_TENANT_MAP[String(tgConfig.adminChatId)]) {
-        CHAT_TENANT_MAP[String(tgConfig.adminChatId)] = { tenantId: TENANT_ID, expertSlug: EXPERT_SLUG, expertName: EXPERT_NAME, isAdmin: true };
-        console.log('[nc] Admin chat registered: ' + tgConfig.adminChatId);
       }
       // DR MAGfield group — hardcoded for single-tenant instance
       var magfieldGroupId = '-1003771302334';
@@ -1364,7 +1359,6 @@ async function loadAgentIdentity() {
         CHAT_TENANT_MAP[magfieldGroupId] = { tenantId: TENANT_ID, expertSlug: EXPERT_SLUG, expertName: EXPERT_NAME, isAdmin: false, isGroup: true };
         console.log('[nc] MAGfield group registered: ' + magfieldGroupId);
       }
-    }
     // Load behavioral lessons from consciousness.update events
     var lessonsUrl = SUPABASE_URL + '/rest/v1/agent_event_bus?event_type=eq.consciousness.update&status=eq.completed&tenant_id=eq.' + TENANT_ID + '&select=payload&order=created_at.desc&limit=10';
     var lessonEvents = await httpsGet(lessonsUrl, { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }, 5000).catch(function() { return []; });
