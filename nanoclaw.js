@@ -17,6 +17,7 @@
 
 const https = require('https');
 const http = require('http');
+const path = require('path');
 const crypto = require('crypto');
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -111,6 +112,48 @@ const CHAT_TENANT_MAP = {
 };
 // SEC-03: No default tenant — unknown chat IDs are rejected
 var DEFAULT_TENANT = null;
+
+// ============================================================================
+// CRITICAL #7: REVIEW STATE — file-backed, survives NanoClaw restart
+// creative-cache/ dir: ~/lv-agent/creative-cache/ (Mac Mini) or /opt/lv/creative-cache/ (DO)
+// ============================================================================
+var contentReview = {}; // In-memory cache: contentId -> review state
+var REVIEW_CACHE_DIR = path.join(process.cwd(), 'creative-cache');
+
+function persistReview(contentId, review) {
+  try {
+    var dir = REVIEW_CACHE_DIR;
+    if (!require('fs').existsSync(dir)) require('fs').mkdirSync(dir, { recursive: true });
+    require('fs').writeFileSync(path.join(dir, contentId + '.json'), JSON.stringify({
+      contentId: contentId,
+      status: review.status,
+      chatId: review.chatId,
+      caption: review.caption,
+      revision: review.revision || 0,
+      updatedAt: new Date().toISOString(),
+    }));
+  } catch(e) { console.warn('[nc] persistReview failed:', e.message); }
+}
+
+function restoreReviewState() {
+  try {
+    var dir = REVIEW_CACHE_DIR;
+    if (!require('fs').existsSync(dir)) return;
+    var files = require('fs').readdirSync(dir);
+    var restored = 0;
+    files.forEach(function(f) {
+      if (!f.endsWith('.json')) return;
+      try {
+        var r = JSON.parse(require('fs').readFileSync(path.join(dir, f), 'utf8'));
+        if (r.status === 'in_review') {
+          contentReview[r.contentId] = r;
+          restored++;
+        }
+      } catch(e) {}
+    });
+    if (restored > 0) console.log('[nc] Review state restored: ' + restored + ' in-review items');
+  } catch(e) { console.warn('[nc] restoreReviewState failed:', e.message); }
+}
 
 // ============================================================================
 // HTTPS HELPERS
@@ -506,7 +549,7 @@ function compileAndSendDigest() {
   sendTelegram(GEO_ADMIN_CHAT_ID, msg).catch(function(e) {
     console.error('[nc] Daily digest failed:', e.message || e);
   });
-  emitAudit('nanoclaw.daily_digest_sent', { date: utcDate, tokensLeft: geoTokenBudget.remaining });
+  emitAudit('nanoclaw.daily_digest_sent', { date: new Date().toISOString().slice(0, 10), tokensLeft: geoTokenBudget.remaining });
 }
 
 // Run digest check every 5 minutes
@@ -699,6 +742,16 @@ var ALL_TOOLS = [
   { name: 'broadcast', description: 'Send approved content to Telegram GROUP and/or Kiosk. Admin-only. Use after approving generated content.', input_schema: { type: 'object', properties: { message: { type: 'string', description: 'Message to broadcast' }, mediaUrl: { type: 'string', description: 'Image/video URL to attach' }, mediaType: { type: 'string', enum: ['photo', 'video', 'animation'], description: 'Media type' } }, required: ['message'] } },
   { name: 'event_campaign', description: 'Create content campaign for a KRPM golf event. Generates schedule: T-7 hype, T-1 reminder, T-0 event day, T+1 recap. Admin-only.', input_schema: { type: 'object', properties: { name: { type: 'string', description: 'Event name' }, date: { type: 'string', description: 'Event date YYYY-MM-DD' }, offer: { type: 'string', description: 'Special offer' } }, required: ['name', 'date'] } },
   { name: 'render_video', description: 'Render Content Atom as MP4 video using Remotion (local Mac Mini, no API timeout). Returns video file path.', input_schema: { type: 'object', properties: { headline: { type: 'string', description: 'Video headline' }, body: { type: 'string', description: 'Body text' }, cta: { type: 'string', description: 'CTA text' }, type: { type: 'string', description: 'Content type' }, product: { type: 'string', description: 'Product name' }, eventName: { type: 'string', description: 'Event name' }, eventDate: { type: 'string', description: 'Event date' } }, required: ['headline'] } },
+  // === INTEGRATIONS (Google Calendar + Drive + Notion) ===
+  { name: 'create_calendar_event', description: 'Create a Google Calendar event. Use for scheduling sessions, appointments, follow-ups. Returns event link.', input_schema: { type: 'object', properties: { title: { type: 'string', description: 'Event title' }, startTime: { type: 'string', description: 'ISO 8601 start (e.g. 2026-04-05T09:00:00+08:00)' }, endTime: { type: 'string', description: 'ISO 8601 end' }, description: { type: 'string', description: 'Event description' }, location: { type: 'string', description: 'Location (e.g. KRPM Experience Lounge)' } }, required: ['title', 'startTime', 'endTime'] } },
+  { name: 'read_drive_file', description: 'Read a file from Google Drive. Returns file content. Use when admin asks to check a shared document.', input_schema: { type: 'object', properties: { fileId: { type: 'string', description: 'Google Drive file ID' }, fileName: { type: 'string', description: 'File name to search for' } }, required: ['fileId'] } },
+  { name: 'sync_google_drive', description: 'Sync Google Drive folder to knowledge base. Imports documents as KUs.', input_schema: { type: 'object', properties: { folderId: { type: 'string', description: 'Drive folder ID to sync' } }, required: [] } },
+  { name: 'notion_search', description: 'Search Notion workspace. Find pages, databases, events, patient notes. Use when admin asks about Notion content.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Search query' } }, required: ['query'] } },
+  { name: 'notion_fetch', description: 'Fetch full content of a Notion page by URL or ID. Use after notion_search to get details.', input_schema: { type: 'object', properties: { pageId: { type: 'string', description: 'Notion page ID or URL' } }, required: ['pageId'] } },
+  // === CLINICAL TOOLS (gateway proxy) ===
+  { name: 'get_daily_brief', description: 'Get daily patient brief — summary of today scheduled patients, follow-ups due, alerts.', input_schema: { type: 'object', properties: {} } },
+  { name: 'get_patient_insights', description: 'Get AI insights for a specific patient — health trends, risk factors, recommendations.', input_schema: { type: 'object', properties: { patientName: { type: 'string', description: 'Patient name' } }, required: ['patientName'] } },
+  { name: 'escalate_emergency', description: 'Escalate a medical emergency. Sends alert to expert + admin + emergency contacts.', input_schema: { type: 'object', properties: { patientName: { type: 'string', description: 'Patient name' }, situation: { type: 'string', description: 'Emergency description' }, severity: { type: 'string', enum: ['urgent', 'critical', 'life-threatening'], description: 'Severity level' } }, required: ['situation', 'severity'] } },
 ];
 
 // Scope by persona
@@ -712,8 +765,22 @@ function sanitize(str) {
 }
 
 async function executeToolCall(toolName, input, tenant, correlationId) {
+  try {
+  var _toolResult = await _executeToolCallInner(toolName, input, tenant, correlationId);
+  // V12: Track tool usage for experience emission
+  if (typeof toolsActuallyUsed !== 'undefined') toolsActuallyUsed.push({ name: toolName, success: true });
+  return _toolResult;
+  } catch (toolErr) {
+    var errMsg = toolErr instanceof Error ? toolErr.message : String(toolErr);
+    console.error('[nc] Tool error:', toolName, errMsg.slice(0, 100));
+    emitAudit('tool.error', { tool: toolName, error: errMsg.slice(0, 200), tenantId: tenant ? tenant.tenantId : null, correlationId: correlationId });
+    return { error: 'Tool failed: ' + toolName + ' — ' + errMsg.slice(0, 80) };
+  }
+}
+
+async function _executeToolCallInner(toolName, input, tenant, correlationId) {
   // SEC-06: Validate tool name against allowlist
-  var allowedTools = ['query_knowledge', 'get_patient_roster', 'create_patient', 'start_intake', 'ask_wellness_question', 'get_synthesized_capsule', 'task_mirror', 'verify_response', 'send_to_group', 'schedule_followup', 'list_scheduled_tasks', 'create_checkout_link', 'voice_response', 'verify_url', 'generate_tts', 'generate_i2v', 'poll_i2v', 'set_user_preference', 'design_feedback', 'generate_content', 'broadcast', 'event_campaign', 'render_video'];
+  var allowedTools = ['query_knowledge', 'get_patient_roster', 'create_patient', 'start_intake', 'ask_wellness_question', 'get_synthesized_capsule', 'task_mirror', 'verify_response', 'send_to_group', 'schedule_followup', 'list_scheduled_tasks', 'create_checkout_link', 'voice_response', 'verify_url', 'generate_tts', 'generate_i2v', 'poll_i2v', 'set_user_preference', 'design_feedback', 'generate_content', 'broadcast', 'event_campaign', 'render_video', 'create_calendar_event', 'read_drive_file', 'sync_google_drive', 'notion_search', 'notion_fetch', 'get_daily_brief', 'get_patient_insights', 'escalate_emergency'];
   if (allowedTools.indexOf(toolName) === -1) {
     return Promise.resolve({ error: 'Tool not in allowlist: ' + toolName });
   }
@@ -952,6 +1019,51 @@ async function executeToolCall(toolName, input, tenant, correlationId) {
       } catch (re) { return { error: 'Render failed: ' + (re.message || '').slice(0, 100) }; }
     }
 
+    // === INTEGRATION TOOLS (gateway proxy) ===
+    case 'create_calendar_event':
+      return httpsPost(MOTHERSHIP + '/api/gateway/create_calendar_event', gwHeaders, {
+        title: input.title, startTime: input.startTime, endTime: input.endTime,
+        description: input.description || '', location: input.location || '',
+        tenantId: tenant.tenantId, expertSlug: tenant.expertSlug,
+      }, 15000);
+
+    case 'read_drive_file':
+      return httpsPost(MOTHERSHIP + '/api/gateway/read_drive_file', gwHeaders, {
+        fileId: input.fileId, fileName: input.fileName,
+        tenantId: tenant.tenantId,
+      }, 30000);
+
+    case 'sync_google_drive':
+      return httpsPost(MOTHERSHIP + '/api/gateway/sync_google_drive', gwHeaders, {
+        folderId: input.folderId, tenantId: tenant.tenantId,
+      }, 60000);
+
+    case 'notion_search':
+      return httpsPost(MOTHERSHIP + '/api/gateway/notion_search', gwHeaders, {
+        query: input.query, pageSize: input.pageSize || 5,
+      }, 15000);
+
+    case 'notion_fetch':
+      return httpsPost(MOTHERSHIP + '/api/gateway/notion_fetch', gwHeaders, {
+        pageId: input.pageId,
+      }, 15000);
+
+    case 'get_daily_brief':
+      return httpsPost(MOTHERSHIP + '/api/gateway/get_daily_brief', gwHeaders, {
+        tenantId: tenant.tenantId, expertSlug: tenant.expertSlug,
+      }, 15000);
+
+    case 'get_patient_insights':
+      return httpsPost(MOTHERSHIP + '/api/gateway/get_patient_insights', gwHeaders, {
+        patientName: input.patientName, tenantId: tenant.tenantId,
+      }, 15000);
+
+    case 'escalate_emergency':
+      return httpsPost(MOTHERSHIP + '/api/gateway/escalate_emergency', gwHeaders, {
+        patientName: input.patientName || '', situation: input.situation,
+        severity: input.severity, tenantId: tenant.tenantId,
+      }, 10000);
+
     default:
       return Promise.resolve({ error: 'Unknown tool: ' + toolName });
   }
@@ -968,7 +1080,20 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
     patientName = patientNameCache[entityId.replace('patient:', '')] || null;
   }
 
-  var sys = 'You are Agent 0, Chief of Staff for ' + (tenant.expertName || EXPERT_NAME) + "'s longevity medicine practice.\n\n";
+  // === FIX A: CONSCIOUSNESS DIRECTIVES FIRST (attention hotspot) ===
+  var sys = '';
+  if (consciousnessLessons && consciousnessLessons.length > 0) {
+    sys += '=== MANDATORY BEHAVIORAL RULES (NEVER IGNORE) ===\n';
+    sys += consciousnessLessons.slice(0, 5).map(function(l) { return '- ' + l.slice(0, 120); }).join('\n') + '\n';
+    sys += '=== END MANDATORY RULES ===\n\n';
+  }
+  if (agentConsciousness && agentConsciousness.behavior) {
+    sys += 'BEHAVIOR: ' + agentConsciousness.behavior + '\n';
+  }
+  if (agentConsciousness && agentConsciousness.avoid) {
+    sys += 'AVOID: ' + agentConsciousness.avoid + '\n\n';
+  }
+  sys += 'You are Agent 0, Chief of Staff for ' + (tenant.expertName || EXPERT_NAME) + "'s longevity medicine practice.\n\n";
 
   // IDENTITY
   sys += 'Expert: ' + (tenant.expertName || EXPERT_NAME) + '. ';
@@ -996,10 +1121,8 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
     sys += 'You\'re talking to ' + patientName + '. Call them ' + patientName.split(' ')[0] + '. Be personal.\n\n';
   }
 
-  // BEHAVIORAL LESSONS (compact — max 1 line per lesson)
-  if (consciousnessLessons.length > 0) {
-    sys += 'Lessons: ' + consciousnessLessons.slice(0, 3).map(function(l) { return l.slice(0, 60); }).join('. ') + '.\n';
-  }
+  // BEHAVIORAL LESSONS — now at prompt start (Fix A), keeping compact reminder here
+  // Removed: lessons are at position 0 for MiniMax M2.7 attention compliance
 
   // KNOWN PATIENTS — NEVER expose in group chats (PHI violation)
   var knownNames = Object.values(patientNameCache);
@@ -1035,7 +1158,17 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
   if (isGroup) sys += "- GROUP: Never mention other patients. Never list names. PHI queries = redirect to DM.\n";
   sys += "\n";
   if (entity.anchor) sys += 'Context: ' + entity.anchor + '\n';
-  if (entity.digest) sys += 'Recent: ' + entity.digest + '\n';
+  // === FIX C: History cap at 6 turns (was unbounded) ===
+  var HISTORY_CAP = 6;
+  if (entity.turns && entity.turns.length > 0) {
+    var cappedTurns = entity.turns.slice(-HISTORY_CAP);
+    sys += '\nRecent conversation:\n';
+    sys += cappedTurns.map(function(t) {
+      return (t.role === 'user' ? 'Patient' : 'You') + ': ' + (t.content || '').slice(0, 300);
+    }).join('\n') + '\n';
+  } else if (entity.digest) {
+    sys += 'Recent: ' + entity.digest + '\n';
+  }
 
   return sys;
 }
@@ -1383,6 +1516,24 @@ async function loadAgentIdentity() {
       consciousnessLessons = Array.from(new Set(consciousnessLessons));
       if (consciousnessLessons.length > 0) console.log('[nc] Loaded ' + consciousnessLessons.length + ' behavioral lessons');
     }
+
+    // FIX: Load expert names from expert_profiles (not agent name)
+    var expertNameUrl = SUPABASE_URL + '/rest/v1/expert_profiles?is_active=eq.true&select=display_name,primary_tenant_id&limit=20';
+    var expertNames = await httpsGet(expertNameUrl, { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }, 5000).catch(function() { return []; });
+    if (expertNames && expertNames.length > 0) {
+      for (var ei = 0; ei < expertNames.length; ei++) {
+        var ep = expertNames[ei];
+        if (ep.display_name && ep.primary_tenant_id) {
+          for (var ck in CHAT_TENANT_MAP) {
+            if (CHAT_TENANT_MAP[ck].tenantId === ep.primary_tenant_id) {
+              CHAT_TENANT_MAP[ck].expertName = ep.display_name;
+            }
+          }
+        }
+      }
+      console.log('[nc] Expert names resolved for ' + expertNames.length + ' profiles');
+    }
+
     // Dynamic group chat registration — loads groupChatIds from agents.gateway_config
     var agentGwUrl = SUPABASE_URL + '/rest/v1/agents?agent_type=eq.chief_of_staff&select=gateway_config,tenant_id,name&limit=20';
     var agentGw = await httpsGet(agentGwUrl, { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }, 5000).catch(function() { return []; });
@@ -1406,6 +1557,9 @@ async function loadAgentIdentity() {
     }
   } catch (e) { console.warn('[nc] Identity load failed:', e.message || e); }
 }
+
+// CRITICAL #7: Restore in-review state from file on boot
+restoreReviewState();
 
 setInterval(function() { loadAgentIdentity().catch(function() {}); }, 5 * 60 * 1000);
 
@@ -1445,13 +1599,48 @@ function seedBrandDNA() {
 // Usage: var brand = getEntity(chatId, 'system:brand_dna').brand;
 
 // AGENT HEARTBEAT — emits health signal every 5min for Meta-Observer
-setInterval(function() {
+// === V12: Proactive heartbeat (60s) + pending-actions polling + config manifest ===
+var _v12ConfigHash = (function() {
+  try { return require('crypto').createHash('sha256').update(JSON.stringify({
+    version: 'v12-accountability', historyCap: 6, consciousnessPosition: 'start',
+    mandatoryPreFetch: true, experienceEmission: true, proactiveHeartbeat: true,
+  })).digest('hex').slice(0, 16); } catch(e) { return 'unknown'; }
+})();
+
+setInterval(async function() {
+  // Proactive: poll pending-actions per tenant
+  var tenantIds = [];
+  try { tenantIds = [...new Set(Object.values(CHAT_TENANT_MAP).map(function(t) { return t.tenantId; }).filter(Boolean))]; } catch(e) {}
+  for (var _tid of tenantIds) {
+    try {
+      var _actions = await httpsGet(MOTHERSHIP + '/api/agent/pending-actions?tenantId=' + _tid, { 'X-MCP-API-Key': getMcpKey(_tid) }, 5000);
+      if (_actions && _actions.success && _actions.items && _actions.items.length > 0) {
+        for (var _act of _actions.items) {
+          var _actChat = _act.chatId || _act.chat_id;
+          if (!_actChat) continue;
+          var _actType = _act.type || _act.action_type || 'reminder';
+          var _actMsg = _act.message || 'Just checking in — how are you doing?';
+          var _actName = _act.patientName || 'there';
+          if (_actType === 'followup_reminder' || _actType === 'milestone_check') {
+            await sendTelegram(_actChat, 'Hi ' + _actName + '! ' + _actMsg);
+            emitAudit('nanoclaw.proactive_action', { type: _actType, tenantId: _tid, chatId: String(_actChat) });
+          }
+        }
+      }
+    } catch(e) { /* non-blocking per tenant */ }
+  }
+  // Heartbeat + config manifest
   emitAudit("agent.heartbeat", {
-    tenantId: TENANT_ID, instance: require("os").hostname(),
-    uptime: Math.round(process.uptime()), messageCount: msgCount,
+    tenantId: TENANT_ID,
+    instance: require("os").hostname(),
+    uptime: Math.round(process.uptime()),
+    messageCount: msgCount,
     memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+    pendingActionsPolled: true,
+    configHash: _v12ConfigHash,
+    version: 'v12-accountability',
   });
-}, 5 * 60 * 1000);
+}, 60 * 1000);
 
 
 // CLINICAL QUERY DETECTOR — routes clinical to Anthropic, admin to MiniMax
@@ -1589,6 +1778,7 @@ function persistConversationData(chatId, entityId, text, response, tenant) {
 }
 
 async function handleMessage(msg) {
+  var toolsActuallyUsed = []; // V12: track tools for experience emission
   var chatId = msg.chat.id;
   var text = msg.text || msg.caption || '';
   var userName = msg.from ? (msg.from.first_name || msg.from.username || 'User') : 'User';
@@ -1825,8 +2015,10 @@ async function handleMessage(msg) {
   // This is a HARD gate — the LLM never sees the query, cannot leak PHI.
   var isGroup = chatId < 0;
   if (isGroup) { // Expanded: catch ALL PHI queries in groups, not just entity-scoped
-    var phiPatterns = /(health|condition|medication|allergy|blood|test|result|diagnosis|symptom|treatment|protocol|EBV|CMV|G6PD|cancer|tumor|biopsy|lab|HbA1c|cholesterol)/i;
+    var phiPatterns = /(health|condition|medication|allergy|blood|test|result|diagnosis|symptom|treatment|protocol|EBV|CMV|G6PD|cancer|tumor|biopsy|lab|HbA1c|cholesterol|supplement|dosage|prescription|capsule|intake|session)/i;
     var mentionsPatient = false; for (var pid in patientNameCache) { var fn = patientNameCache[pid].split(" ")[0].toLowerCase(); if (fn.length > 2 && text.toLowerCase().includes(fn)) { mentionsPatient = true; break; } }
+    // Cross-tenant PHI: detect proper nouns (names not in local patient cache)
+    var properNounMatch = text.match(/(?:for|about|of|show me|check|review)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)/); if (properNounMatch) mentionsPatient = true;
     if (phiPatterns.test(text) && (mentionsPatient || (entityId && entityId.startsWith("patient:")))) {
       console.log('[nc] SEC-PHI-GROUP: Blocked PHI query in group for ' + entityId);
       await sendTelegram(chatId, 'For patient privacy, I cannot discuss individual health details in the group chat. Please send me a direct message for this — tap @LongevityValley_Bot and hit Start.');
@@ -1861,6 +2053,25 @@ async function handleMessage(msg) {
       reply += '- NanoClaw: v10-ESAGM, entities=' + Object.keys(getChat(chatId).entities).length + ', msgs=' + msgCount;
       await sendTelegram(chatId, reply);
       persistConversationData(chatId, entityId, text, response, tenant);
+    // === V12: Experience emission (Improvement 4) ===
+    var _brandTerms = (tenant.brandTerms || []).concat(['Protocol', 'verified by', tenant.expertName || EXPERT_NAME]).filter(Boolean);
+    var _brandCited = _brandTerms.some(function(t) { return (reply || '').toLowerCase().includes(t.toLowerCase()); });
+    httpsPost(MOTHERSHIP + '/api/agent/event-bus', { 'X-MCP-API-Key': getMcpKey(tenant.tenantId), 'Content-Type': 'application/json' }, {
+      event_type: 'agent.experience.report', source: 'nanoclaw', target: 'maestro',
+      tenant_id: tenant.tenantId, status: 'active',
+      payload: { requestId: correlationId, timestamp: new Date().toISOString(),
+        toolsUsed: (typeof toolsActuallyUsed !== 'undefined' ? toolsActuallyUsed : []).map(function(t) { return t.name; }),
+        toolSuccess: (typeof toolsActuallyUsed !== 'undefined' ? toolsActuallyUsed : []).every(function(t) { return t.success; }),
+        rulesReferenced: ((reply || '').match(/Protocol/gi) || []).length,
+        moatConfidence: 0, holmesVerdict: 'skipped',
+        deflected: /contact\s+(your\s+)?doctor/i.test(reply || ''),
+        brandCited: _brandCited, responseLength: (reply || '').length,
+        queryDomain: isClinicalQuery(text) ? 'clinical' : 'general',
+        sessionTurn: { entityId: entityId, persona: persona, provider: provider || 'unknown',
+          isClinical: isClinicalQuery(text), isGroupChat: chatId < 0, turnNumber: getEntity(String(chatId), entityId).turns.length },
+      },
+    }, 5000).catch(function(e) { console.log('[nc] Experience emit failed:', e.message || e); });
+    
     emitAudit('nanoclaw.response', { correlationId: correlationId, chatId: chatId, entity: entityId, persona: 'cos', responseLength: reply.length, fastPath: true });
       return;
     } catch (e) {
@@ -1894,6 +2105,39 @@ async function handleMessage(msg) {
       } catch(e) { /* non-blocking — use cached consciousness */ }
     }
     var systemPrompt = buildSystemPrompt(persona, entityId, chatId, tenant);
+
+  // === FIX B: Directive injection into user message ===
+  var enforcement = '';
+  if (isClinicalQuery(text) || (text && /brand|product|service|offer|treatment/i.test(text))) {
+    enforcement = '[RULES: 1. ALWAYS call query_knowledge before answering health questions. '
+      + '2. ALWAYS cite Protocol name + "verified by ' + (tenant.expertName || EXPERT_NAME) + '". '
+      + '3. Include Confidence percentage. '
+      + '4. Phone: ' + (tenant.phone || '+6012-659 5319') + ']\n\n';
+  }
+
+  // === IMPROVEMENT 2: Mandatory KB pre-fetch (FM-14 cross-session knowledge) ===
+  var knowledgeContext = '';
+  if (isClinicalQuery(text) || (text && /brand|product|service|offer|treatment/i.test(text))) {
+    try {
+      var kbResult = await callTool('query_knowledge', {
+        query: (text || '').slice(0, 500),
+        tenantId: tenant.tenantId,
+        limit: 5
+      }, tenant, correlationId);
+      if (kbResult && kbResult.results && kbResult.results.length > 0) {
+        knowledgeContext = '\n=== VERIFIED KNOWLEDGE (cite these in your response) ===\n';
+        for (var _ki = 0; _ki < Math.min(kbResult.results.length, 3); _ki++) {
+          var _kr = kbResult.results[_ki];
+          var _kt = _kr.rule_title || _kr.category || 'Knowledge';
+          var _kc = (_kr.content || _kr.raw_content || '').slice(0, 200);
+          knowledgeContext += '- [' + _kt + '] ' + _kc + '\n';
+        }
+        knowledgeContext += '=== END KNOWLEDGE ===\n';
+      }
+    } catch(e) { console.log('[nc] KB pre-fetch failed (graceful):', e.message || e); }
+  }
+  // Inject knowledge at position 0 (highest attention) + enforcement into user text
+  systemPrompt = knowledgeContext + systemPrompt;
   var entityMemory = getEntity(chatId, entityId);
 
   // History goes in system prompt (NOT as separate messages)
@@ -1911,7 +2155,7 @@ async function handleMessage(msg) {
     systemPrompt += '\n\nConversation history for this entity:\n' + historyText;
   }
   // ONLY the current user message goes in messages array — clean for tool_use
-  var contextMessages = [{ role: 'user', content: text }];
+  var contextMessages = [{ role: 'user', content: enforcement + text }];
 
   try {
     var response;
