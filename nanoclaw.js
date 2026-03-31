@@ -1613,7 +1613,7 @@ setInterval(async function() {
   try { tenantIds = [...new Set(Object.values(CHAT_TENANT_MAP).map(function(t) { return t.tenantId; }).filter(Boolean))]; } catch(e) {}
   for (var _tid of tenantIds) {
     try {
-      var _actions = await httpsGet(MOTHERSHIP + '/api/agent/pending-actions?tenantId=' + _tid, { 'X-MCP-API-Key': getMcpKey(_tid) }, 5000);
+      var _actions = await httpsGet(MOTHERSHIP + '/api/agent/pending-actions?tenantId=' + _tid, { 'X-MCP-API-Key': getMcpKey(_tid), 'x-correlation-id': 'heartbeat-' + Date.now() }, 5000);
       if (_actions && _actions.success && _actions.items && _actions.items.length > 0) {
         for (var _act of _actions.items) {
           var _actChat = _act.chatId || _act.chat_id;
@@ -1953,7 +1953,7 @@ async function handleMessage(msg) {
     var expertName = tenant.expertName || EXPERT_NAME;
     var rulesCount = 0;
     try {
-      var r = await httpsGet(MOTHERSHIP + '/api/agent/consciousness?tenantId=' + tenant.tenantId, { 'X-MCP-API-Key': getMcpKey(tenant.tenantId) }, 5000).catch(function() { return null; });
+      var r = await httpsGet(MOTHERSHIP + '/api/agent/consciousness?tenantId=' + tenant.tenantId, { 'X-MCP-API-Key': getMcpKey(tenant.tenantId), 'x-correlation-id': correlationId || '' }, 5000).catch(function() { return null; });
       if (r && r.practiceScope) rulesCount = r.practiceScope.rules || 0;
     } catch(e) {}
     // Trust Layer 3: Authority — credential banner on first contact
@@ -2036,6 +2036,7 @@ async function handleMessage(msg) {
   emitAudit('nanoclaw.message', {
     correlationId: correlationId, chatId: String(chatId).slice(-4),
     entity: safeEntityId, persona: persona,
+    tenantId: tenant ? tenant.tenantId : null,
   });
 
   // 3b. Fast path: "status check" → instant API call, no LLM
@@ -2072,7 +2073,7 @@ async function handleMessage(msg) {
       },
     }, 5000).catch(function(e) { console.log('[nc] Experience emit failed:', e.message || e); });
     
-    emitAudit('nanoclaw.response', { correlationId: correlationId, chatId: chatId, entity: entityId, persona: 'cos', responseLength: reply.length, fastPath: true });
+    emitAudit('nanoclaw.response', { correlationId: correlationId, chatId: chatId, entity: entityId, persona: 'cos', responseLength: reply.length, fastPath: true, tenantId: tenant ? tenant.tenantId : null });
       return;
     } catch (e) {
       console.error('[nc] Status fast path failed:', e.message);
@@ -2217,6 +2218,7 @@ async function handleMessage(msg) {
     emitAudit('nanoclaw.response', {
       correlationId: correlationId, chatId: chatId, entity: entityId,
       persona: persona, responseLength: response.length,
+      tenantId: tenant ? tenant.tenantId : null,
     });
 
   } catch (e) {
