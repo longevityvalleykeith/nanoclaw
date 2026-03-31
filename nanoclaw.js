@@ -780,7 +780,7 @@ async function executeToolCall(toolName, input, tenant, correlationId) {
 
 async function _executeToolCallInner(toolName, input, tenant, correlationId) {
   // SEC-06: Validate tool name against allowlist
-  var allowedTools = ['query_knowledge', 'get_patient_roster', 'create_patient', 'start_intake', 'ask_wellness_question', 'get_synthesized_capsule', 'task_mirror', 'verify_response', 'send_to_group', 'schedule_followup', 'list_scheduled_tasks', 'create_checkout_link', 'voice_response', 'verify_url', 'generate_tts', 'generate_i2v', 'poll_i2v', 'set_user_preference', 'design_feedback', 'generate_content', 'broadcast', 'event_campaign', 'render_video', 'create_calendar_event', 'read_drive_file', 'sync_google_drive', 'notion_search', 'notion_fetch', 'get_daily_brief', 'get_patient_insights', 'escalate_emergency'];
+  var allowedTools = ['query_knowledge', 'get_patient_roster', 'create_patient', 'start_intake', 'ask_wellness_question', 'get_synthesized_capsule', 'task_mirror', 'verify_response', 'send_to_group', 'schedule_followup', 'list_scheduled_tasks', 'create_checkout_link', 'voice_response', 'verify_url', 'generate_tts', 'generate_i2v', 'poll_i2v', 'set_user_preference', 'design_feedback', 'generate_content', 'broadcast', 'event_campaign', 'render_video', 'create_calendar_event', 'read_drive_file', 'sync_google_drive', 'notion_search', 'notion_fetch', 'get_daily_brief', 'get_expert_queue', 'process_expert_queue', 'get_patient_insights', 'escalate_emergency'];
   if (allowedTools.indexOf(toolName) === -1) {
     return Promise.resolve({ error: 'Tool not in allowlist: ' + toolName });
   }
@@ -1146,6 +1146,14 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
   sys += "- Format: \"Based on Protocol [rule_title] (verified by " + (tenant.expertName || EXPERT_NAME) + ")\"\n";
   sys += "- Show confidence: \"Confidence: [X]%\" when from ask_wellness_question\n";
   sys += "- If confidence < 50%: \"This needs expert review. Flagging for " + (tenant.expertName || EXPERT_NAME) + ".\"\n\n";
+  // FM-W5: MiniMax Toolhub Harness — prevent incapability hallucination
+  sys += "YOUR TOOLS (NEVER say you can't if a tool exists):\n";
+  sys += "- query_knowledge: Search clinical rules. get_patient_roster: List patients\n";
+  sys += "- get_expert_queue: List pending review items. process_expert_queue: Approve/reject\n";
+  sys += "- start_intake: Begin assessment. schedule_followup: Queue follow-up msg\n";
+  sys += "- notion_search + notion_fetch: Search/read Notion. get_daily_brief: Practice overview\n";
+  sys += "- create_patient: Register new. send_to_group: Broadcast. ask_wellness_question: Full Q\&A\n";
+  sys += "RULE: If admin asks to do something and a tool exists — CALL IT. Never say I cannot.\n\n";
   sys += "Rules:\n";
   sys += "- SELF-MODEL: NEVER say Done/Sent/Notified unless a tool call returned SUCCESS. If you did not call a tool, you did NOT do it.\n";
   sys += "- SELF-MODEL: Before claiming you reached someone, verify you have their chat_id. If not, say so.\n";
