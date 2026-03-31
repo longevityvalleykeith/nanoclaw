@@ -2286,6 +2286,17 @@ async function poll() {
                 chatId: reactChatId, tenantId: reactTenant.tenantId,
                 messageId: reaction.message_id, emoji: emojiList.join(','), sentiment: sentiment,
               });
+              // BRK-2: Content delivery trace — reaction on content review
+              var reviewedContent = contentReview[String(reaction.message_id)];
+              if (reviewedContent) {
+                var reviewStatus = sentiment === 'positive' ? 'approved' : (sentiment === 'negative' ? 'rejected' : 'neutral');
+                emitAudit('content.reviewed', {
+                  contentId: reviewedContent.contentId || String(reaction.message_id),
+                  status: reviewStatus, tenantId: reactTenant.tenantId,
+                  correlationId: reviewedContent.correlationId || 'review-' + reaction.message_id,
+                  chatId: reactChatId, emoji: emojiList.join(','),
+                });
+              }
             }
           }
         }
