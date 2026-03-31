@@ -2204,14 +2204,9 @@ async function handleMessage(msg) {
     await sendTelegram(chatId, response);
     console.log('[nc] Delivered (' + response.length + ' chars) entity=' + entityId);
 
-      // HACPO experience report (non-blocking)
-      emitAudit('agent.experience.report', {
-        tenantId: tenant.tenantId, chatId: chatId, entityId: entityId,
-        provider: (MINIMAX_KEY && !isClinicalQuery(text)) ? 'minimax' : (ANTHROPIC_KEY ? 'anthropic' : 'gateway'),
-        responseLength: (response || '').length,
-        deflected: (response || '').indexOf('I cannot') >= 0 || (response || '').indexOf('contact your doctor') >= 0,
-        correlationId: correlationId,
-      });
+      // LEGACY experience report DISABLED — v12 emission (line ~2060) goes through
+      // /api/agent/event-bus POST route which triggers BRK-6 VE bridge
+      // emitAudit('agent.experience.report', { ... });
 
     // 9. Audit: response delivered (G1)
     persistConversationData(chatId, entityId, text, response, tenant);
