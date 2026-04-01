@@ -806,7 +806,7 @@ async function _executeToolCallInner(toolName, input, tenant, correlationId) {
     if (typeof input[key] === 'string') input[key] = sanitize(input[key]);
   }
   var authHeaders = { 'x-cron-secret': CRON_SECRET, 'x-correlation-id': correlationId };
-  var gwHeaders = { 'X-MCP-API-Key': MCP_KEY, 'x-correlation-id': correlationId };
+  var gwHeaders = { 'X-MCP-API-Key': getMcpKey(tenant ? tenant.tenantId : TENANT_ID), 'x-correlation-id': correlationId };
 
   switch (toolName) {
     case 'query_knowledge':
