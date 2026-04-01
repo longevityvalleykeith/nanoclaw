@@ -813,8 +813,10 @@ async function _executeToolCallInner(toolName, input, tenant, correlationId) {
       return httpsGet(MOTHERSHIP + '/api/agent/query-knowledge?tenant_id=' + tenant.tenantId + '&query=' + encodeURIComponent(input.query || '') + '&limit=5', authHeaders, 10000);
 
     case 'get_patient_roster':
+      // SEC-002-C: ALWAYS use tenant's own expertSlug — NEVER let LLM override
+      // ML-322: LLM tried keith-koo slug when ping-care returned empty → cross-tenant leak
       return httpsPost(MOTHERSHIP + '/api/gateway/get_patient_roster', gwHeaders, {
-        expertSlug: input.expertSlug || tenant.expertSlug,
+        expertSlug: tenant.expertSlug,  // FORCED — ignore input.expertSlug
         tenantId: tenant.tenantId,
       }, 15000);
 
