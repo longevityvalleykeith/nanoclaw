@@ -2529,7 +2529,7 @@ http.createServer(function(req, res) {
   }
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
-    status: 'ok', agent: 'nanoclaw-v11.3.0', messages: msgCount,
+    status: 'ok', agent: 'nanoclaw-v12.2.1-auto-onboard', messages: msgCount,
     uptime: Math.round(process.uptime()),
     memory: { type: 'ESAGM', entities: Object.keys(entities).length }, // SEC-07: no patient names in health
     capabilities: ANTHROPIC_KEY ? 'tool_use+esagm' : 'gateway_only',
@@ -2547,7 +2547,7 @@ http.createServer(function(req, res) {
 
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', agent: 'nanoclaw-v11.3.0-kiosk', tools: ALL_TOOLS.length }));
+    res.end(JSON.stringify({ status: 'ok', agent: 'nanoclaw-v12.2.1-auto-onboard-kiosk', tools: ALL_TOOLS.length }));
     return;
   }
 
@@ -2567,7 +2567,7 @@ http.createServer(function(req, res) {
 }).listen(KIOSK_PORT, '0.0.0.0');
 console.log('[nc] Kiosk API on :' + KIOSK_PORT + ' (Tailscale-accessible)');
 
-console.log('[nc] NanoClaw v11.3.0 on :' + HEALTH_PORT);
+console.log('[nc] NanoClaw v12.2.1-auto-onboard on :' + HEALTH_PORT);
 console.log('[nc] Persona: COS (admin) + Expert Rep (Keith Koo)');
 console.log('[nc] Memory: Entity-Scoped Attention Graph (per-patient isolation)');
 console.log('[nc] Tools: ' + (ANTHROPIC_KEY ? 'Anthropic tool_use (scoped by persona)' : 'Gateway only (no ANTHROPIC_KEY)'));
@@ -2576,6 +2576,6 @@ loadAgentIdentity().catch(function(e) { console.warn('[nc] Initial identity load
 seedBrandDNA(); // Seed DR MAGfield brand DNA into agent memory
 
 // Startup audit event
-emitAudit('nanoclaw.startup', { version: 'v11.3.0', capabilities: ANTHROPIC_KEY ? 'full' : 'gateway_only', tenantId: TENANT_ID, tenantMode: process.env.TENANT_MODE || 'single', toolCount: ALL_TOOLS.length });
+emitAudit('nanoclaw.startup', { version: 'v12.2.1-auto-onboard', capabilities: ANTHROPIC_KEY ? 'full' : 'gateway_only', tenantId: TENANT_ID, tenantMode: process.env.TENANT_MODE || 'single', toolCount: ALL_TOOLS.length });
 
 poll();
