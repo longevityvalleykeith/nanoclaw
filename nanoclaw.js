@@ -1938,9 +1938,14 @@ async function handleMessage(msg) {
         // Step 4: Send to Gemini directly (same as telegram-media-processor on Mothership)
         var base64Data = fileBuffer.toString('base64');
         var caption = msg.caption || '';
+        var docMimeType = msg.document ? (msg.document.mime_type || '') : '';
+        var isDocument = docMimeType.includes('word') || docMimeType.includes('pdf') || docMimeType.includes('text');
         var geminiPrompt = caption
-          ? 'The user sent this file with the message:  + caption + . Analyze it in a health/wellness context. If it is a lab report, extract all biomarker values.'
-          : 'Analyze this file in a health and wellness context. If it is a lab report, extract all biomarker values with units. Be structured and precise.';
+          ? 'The user sent this file with the message: ' + caption + '. '
+            + (isDocument ? 'Extract and structure ALL text content from this document. Preserve formatting, tables, and headings.' : 'Analyze it in a health/wellness context. If it is a lab report, extract all biomarker values.')
+          : isDocument
+            ? 'Extract and structure ALL text content from this document. Preserve tables, headings, lists, and formatting. Return the full content in a readable format.'
+            : 'Analyze this file in a health and wellness context. If it is a lab report, extract all biomarker values with units. Be structured and precise.';
 
         var geminiKey = process.env.GOOGLE_AI_API_KEY;
         if (!geminiKey) throw new Error('No GOOGLE_AI_API_KEY');
@@ -1978,7 +1983,42 @@ async function handleMessage(msg) {
         });
       } catch (mediaErr) {
         console.warn('[nc] Media processing failed:', mediaErr.message || mediaErr);
-        await sendTelegram(chatId, 'Could not analyze your file. Please try describing it in text, or send it to @LV_Butler_Bot for processing.');
+        // V12.2: NO dead-end redirect. Try alternative processing for documents.
+        var docMime = msg.document ? (msg.document.mime_type || '') : '';
+        var fileName = msg.document ? (msg.document.file_name || '') : '';
+        if (docMime.includes('word') || docMime.includes('pdf') || docMime.includes('document')
+            || fileName.endsWith('.docx') || fileName.endsWith('.pdf') || fileName.endsWith('.doc')) {
+          // Document file — inform user and process via text extraction relay
+          await sendTelegram(chatId, 'I received your document (' + fileName + '). '
+            + 'Document analysis is processing — I will extract the content and work with it. '
+            + 'If processing takes too long, you can also paste the key content as text.');
+          // Relay to Mothership for document processing (has pdf-parse + mammoth)
+          try {
+            var docResult = await httpsPost(MOTHERSHIP + '/api/channel/intake', {
+              'Content-Type': 'application/json',
+              'X-MCP-API-Key': getMcpKey(tenant ? tenant.tenantId : TENANT_ID),
+            }, {
+              relay: true, chatId: chatId, fromUserId: msg.from ? msg.from.id : 0,
+              fromName: msg.from ? (msg.from.first_name || 'User') : 'User',
+              text: '[DOCUMENT: ' + fileName + '] User uploaded a document. Extract and summarize the content.',
+              tenantId: tenant ? tenant.tenantId : TENANT_ID,
+              correlationId: correlationId,
+              isAdmin: tenant ? tenant.isAdmin : false,
+              mediaUrl: 'https://api.telegram.org/file/bot' + TG_TOKEN + '/' + (fileInfo && fileInfo.result ? fileInfo.result.file_path : ''),
+              mediaType: 'document', mimeType: docMime, fileName: fileName,
+            }, 30000);
+            if (docResult && (docResult.response || docResult.text)) {
+              await sendTelegram(chatId, (docResult.response || docResult.text).slice(0, 4096));
+            }
+          } catch(relayErr) {
+            console.warn('[nc] Document relay failed:', relayErr.message || relayErr);
+            await sendTelegram(chatId, 'Document processing is taking longer than expected. '
+              + 'Please paste the key sections as text and I will work with that directly.');
+          }
+        } else {
+          await sendTelegram(chatId, 'I had trouble analyzing that file (' + (mediaErr.message || 'processing error').slice(0, 60)
+            + '). Could you try sending it as a photo, or describe the key content in text?');
+        }
       }
       return;
     }
