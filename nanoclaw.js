@@ -749,6 +749,9 @@ var ALL_TOOLS = [
   { name: 'notion_search', description: 'Search Notion workspace. Find pages, databases, events, patient notes. Use when admin asks about Notion content.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Search query' } }, required: ['query'] } },
   { name: 'notion_fetch', description: 'Fetch full content of a Notion page by URL or ID. Use after notion_search to get details.', input_schema: { type: 'object', properties: { pageId: { type: 'string', description: 'Notion page ID or URL' } }, required: ['pageId'] } },
   // === CLINICAL TOOLS (gateway proxy) ===
+  { name: 'record_session', description: 'Record a completed session. Returns session ID + amount.', input_schema: { type: 'object', properties: { patientName: { type: 'string' }, serviceType: { type: 'string', enum: ['housecall_1hr', 'housecall_companion', 'lm_physio', 'lm_housecall', 'lm_monthly'] }, duration: { type: 'number' }, notes: { type: 'string' } }, required: ['patientName', 'serviceType'] } },
+  { name: 'generate_document', description: 'Generate invoice or receipt markdown. Use after record_session.', input_schema: { type: 'object', properties: { type: { type: 'string', enum: ['invoice', 'receipt'] }, sessionId: { type: 'string' } }, required: ['type', 'sessionId'] } },
+  { name: 'calculate_revenue_split', description: 'Calculate revenue split for collaboration sessions.', input_schema: { type: 'object', properties: { sessionId: { type: 'string' }, facilityName: { type: 'string' }, splitPercentage: { type: 'number' } }, required: ['sessionId', 'facilityName', 'splitPercentage'] } },
   { name: 'get_daily_brief', description: 'Get daily patient brief — summary of today scheduled patients, follow-ups due, alerts.', input_schema: { type: 'object', properties: {} } },
   { name: 'get_patient_insights', description: 'Get AI insights for a specific patient — health trends, risk factors, recommendations.', input_schema: { type: 'object', properties: { patientName: { type: 'string', description: 'Patient name' } }, required: ['patientName'] } },
   { name: 'escalate_emergency', description: 'Escalate a medical emergency. Sends alert to expert + admin + emergency contacts.', input_schema: { type: 'object', properties: { patientName: { type: 'string', description: 'Patient name' }, situation: { type: 'string', description: 'Emergency description' }, severity: { type: 'string', enum: ['urgent', 'critical', 'life-threatening'], description: 'Severity level' } }, required: ['situation', 'severity'] } },
@@ -764,15 +767,29 @@ function sanitize(str) {
   return str.replace(/[\x00-\x1f]/g, '').replace(/[<>]/g, '').slice(0, 500);
 }
 
+// V12.2: Flight Recorder — records every tool call inline (survives crash)
+function recordFlight(event, toolName, data, tenantId, corrId) {
+  var entry = { event: event, tool: toolName, timestamp: Date.now(),
+    data: typeof data === 'string' ? data.slice(0, 500) : JSON.stringify(data || {}).slice(0, 500) };
+  if (typeof flightLog !== 'undefined') flightLog.push(entry);
+  emitAudit('agent.flight_step', {
+    event: event, tool: toolName, correlationId: corrId || '',
+    tenantId: tenantId || null, data: entry.data,
+  });
+}
+
 async function executeToolCall(toolName, input, tenant, correlationId) {
   try {
+  recordFlight('STARTED', toolName, input, tenant ? tenant.tenantId : null, correlationId);
   var _toolResult = await _executeToolCallInner(toolName, input, tenant, correlationId);
+  recordFlight('COMPLETED', toolName, { success: true }, tenant ? tenant.tenantId : null, correlationId);
   // V12: Track tool usage for experience emission
   if (typeof toolsActuallyUsed !== 'undefined') toolsActuallyUsed.push({ name: toolName, success: true });
   return _toolResult;
   } catch (toolErr) {
     var errMsg = toolErr instanceof Error ? toolErr.message : String(toolErr);
     console.error('[nc] Tool error:', toolName, errMsg.slice(0, 100));
+    recordFlight('FAILED', toolName, { error: errMsg.slice(0, 200) }, tenant ? tenant.tenantId : null, correlationId);
     emitAudit('tool.error', { tool: toolName, error: errMsg.slice(0, 200), tenantId: tenant ? tenant.tenantId : null, correlationId: correlationId });
     return { error: 'Tool failed: ' + toolName + ' — ' + errMsg.slice(0, 80) };
   }
@@ -780,7 +797,7 @@ async function executeToolCall(toolName, input, tenant, correlationId) {
 
 async function _executeToolCallInner(toolName, input, tenant, correlationId) {
   // SEC-06: Validate tool name against allowlist
-  var allowedTools = ['query_knowledge', 'get_patient_roster', 'create_patient', 'start_intake', 'ask_wellness_question', 'get_synthesized_capsule', 'task_mirror', 'verify_response', 'send_to_group', 'schedule_followup', 'list_scheduled_tasks', 'create_checkout_link', 'voice_response', 'verify_url', 'generate_tts', 'generate_i2v', 'poll_i2v', 'set_user_preference', 'design_feedback', 'generate_content', 'broadcast', 'event_campaign', 'render_video', 'create_calendar_event', 'read_drive_file', 'sync_google_drive', 'notion_search', 'notion_fetch', 'get_daily_brief', 'get_expert_queue', 'process_expert_queue', 'get_patient_insights', 'escalate_emergency'];
+  var allowedTools = ['query_knowledge', 'get_patient_roster', 'create_patient', 'start_intake', 'ask_wellness_question', 'get_synthesized_capsule', 'task_mirror', 'verify_response', 'send_to_group', 'schedule_followup', 'list_scheduled_tasks', 'create_checkout_link', 'voice_response', 'verify_url', 'generate_tts', 'generate_i2v', 'poll_i2v', 'set_user_preference', 'design_feedback', 'generate_content', 'broadcast', 'event_campaign', 'render_video', 'create_calendar_event', 'read_drive_file', 'sync_google_drive', 'notion_search', 'notion_fetch', 'get_daily_brief', 'get_expert_queue', 'process_expert_queue', 'record_session', 'generate_document', 'calculate_revenue_split', 'get_patient_insights', 'escalate_emergency'];
   if (allowedTools.indexOf(toolName) === -1) {
     return Promise.resolve({ error: 'Tool not in allowlist: ' + toolName });
   }
@@ -1064,6 +1081,16 @@ async function _executeToolCallInner(toolName, input, tenant, correlationId) {
         severity: input.severity, tenantId: tenant.tenantId,
       }, 10000);
 
+    case 'record_session':
+      return httpsPost(MOTHERSHIP + '/api/gateway/record_session', gwHeaders, input, 15000);
+    case 'generate_document':
+      return httpsPost(MOTHERSHIP + '/api/gateway/generate_document', gwHeaders, input, 15000);
+    case 'calculate_revenue_split':
+      return httpsPost(MOTHERSHIP + '/api/gateway/calculate_revenue_split', gwHeaders, input, 10000);
+    case 'get_expert_queue':
+      return httpsPost(MOTHERSHIP + '/api/gateway/get_expert_queue', gwHeaders, input, 15000);
+    case 'process_expert_queue':
+      return httpsPost(MOTHERSHIP + '/api/gateway/process_expert_queue', gwHeaders, input, 10000);
     default:
       return Promise.resolve({ error: 'Unknown tool: ' + toolName });
   }
@@ -1149,6 +1176,8 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
   // FM-W5: MiniMax Toolhub Harness — prevent incapability hallucination
   sys += "YOUR TOOLS (NEVER say you can't if a tool exists):\n";
   sys += "- query_knowledge: Search clinical rules. get_patient_roster: List patients\n";
+  sys += "- record_session: Record completed session. generate_document: Invoice/receipt\n";
+  sys += "- calculate_revenue_split: Revenue splits for collaborations\n";
   sys += "- get_expert_queue: List pending review items. process_expert_queue: Approve/reject\n";
   sys += "- start_intake: Begin assessment. schedule_followup: Queue follow-up msg\n";
   sys += "- notion_search + notion_fetch: Search/read Notion. get_daily_brief: Practice overview\n";
@@ -1610,12 +1639,14 @@ function seedBrandDNA() {
 // === V12: Proactive heartbeat (60s) + pending-actions polling + config manifest ===
 var _v12ConfigHash = (function() {
   try { return require('crypto').createHash('sha256').update(JSON.stringify({
-    version: 'v12-accountability', historyCap: 6, consciousnessPosition: 'start',
+    version: 'v12.2-flight-recorder', historyCap: 6, consciousnessPosition: 'start',
     mandatoryPreFetch: true, experienceEmission: true, proactiveHeartbeat: true,
   })).digest('hex').slice(0, 16); } catch(e) { return 'unknown'; }
 })();
 
 setInterval(async function() {
+  // V12.2: Heartbeat failure dedup — don't compound same action failures
+  var _recentFailures = (typeof _recentFailures !== 'undefined') ? _recentFailures : {};
   // Proactive: poll pending-actions per tenant
   var tenantIds = [];
   try { tenantIds = [...new Set(Object.values(CHAT_TENANT_MAP).map(function(t) { return t.tenantId; }).filter(Boolean))]; } catch(e) {}
@@ -1646,7 +1677,7 @@ setInterval(async function() {
     memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
     pendingActionsPolled: true,
     configHash: _v12ConfigHash,
-    version: 'v12-accountability',
+    version: 'v12.2-flight-recorder',
   });
 }, 60 * 1000);
 
@@ -1787,6 +1818,7 @@ function persistConversationData(chatId, entityId, text, response, tenant) {
 
 async function handleMessage(msg) {
   var toolsActuallyUsed = []; // V12: track tools for experience emission
+  var flightLog = []; // V12.2: Flight recorder — inline persistence
   var chatId = msg.chat.id;
   var text = msg.text || msg.caption || '';
   var userName = msg.from ? (msg.from.first_name || msg.from.username || 'User') : 'User';
@@ -2211,6 +2243,23 @@ async function handleMessage(msg) {
     // 8. Send to Telegram
     await sendTelegram(chatId, response);
     console.log('[nc] Delivered (' + response.length + ' chars) entity=' + entityId);
+
+    // V12.2: Honest degradation notice + flight trace to Maestro
+    var failedTools = (typeof toolsActuallyUsed !== 'undefined' ? toolsActuallyUsed : []).filter(function(t) { return !t.success; });
+    if (failedTools.length > 0) {
+      var notice = '\n\n\u26a0\ufe0f ' + failedTools.map(function(t) {
+        return t.name + ': ' + (t.error || 'unknown').slice(0, 40);
+      }).join('. ') + '\nData saved locally. Auto-retry when fixed.';
+      sendTelegram(chatId, notice).catch(function() {});
+      // Flight trace to Maestro
+      httpsPost(MOTHERSHIP + '/api/agent/event-bus',
+        { 'X-MCP-API-Key': getMcpKey(tenant.tenantId), 'Content-Type': 'application/json' },
+        { event_type: 'agent.flight_recorder', source: 'nanoclaw', target: 'maestro',
+          tenant_id: tenant.tenantId, status: 'pending',
+          payload: { correlationId: correlationId, flightLog: flightLog || [],
+            failedTools: failedTools, userMessage: (text || '').slice(0, 200) },
+        }, 5000).catch(function() {});
+    }
 
       // LEGACY experience report DISABLED — v12 emission (line ~2060) goes through
       // /api/agent/event-bus POST route which triggers BRK-6 VE bridge

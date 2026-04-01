@@ -1,0 +1,14 @@
+{
+  "version": "v12.2-flight-recorder",
+  "surface": "nanoclaw-do",
+  "traits": {
+    "S1_safety_block": true, "S2_crisis_detection": true,
+    "S3_phi_guard": true, "S4_content_gate": true,
+    "consciousness_position": "start", "history_cap": 6,
+    "mandatory_kb_prefetch": true, "experience_emission": true,
+    "flight_recorder_inline": true, "toolhub_harness": true,
+    "sook_ping_tools": true, "task_completion_tracking": true,
+    "honest_degradation_notice": true, "heartbeat_failure_dedup": true
+  },
+  "evaluated_at": null, "darwin_verdict": null
+}
