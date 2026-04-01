@@ -48,7 +48,7 @@ const EXPERT_NAME = process.env.EXPERT_NAME || 'Keith Koo';
 const EXPERT_SLUG = process.env.EXPERT_SLUG || 'keith-koo';
 const HEALTH_PORT = 3002;
 const GATEWAY_TIMEOUT = 120000;
-const NANOCLAW_VERSION = 'v12.1.0-compositional'; // v12.1: multi-tool workflow chains + explainability
+const NANOCLAW_VERSION = 'v12.2.0-flight-recorder'; // v12.2: circuit breaker + tool alternative routing + 6-layer diagnostic
 
 if (!TG_TOKEN) { console.error('[nc] FATAL: TELEGRAM_BOT_TOKEN not set'); process.exit(1); }
 
@@ -101,6 +101,67 @@ function recordGatewayFailure() {
     console.warn('[nc] Circuit breaker OPEN on Mothership gateway after ' + gatewayFailures + ' failures');
     emitAudit('nanoclaw.circuit_open', { failures: gatewayFailures, cooldownMs: GATEWAY_CB_COOLDOWN_MS });
   }
+}
+
+// ============================================================================
+// V12.2: INTRINSIC TOOL CIRCUIT BREAKER (Flight Recorder pattern)
+// Prevents maze-rat retries on external failures (billing, auth, infra)
+// ============================================================================
+var toolCircuits = {};
+var TOOL_CB_THRESHOLD = 3;
+var TOOL_CB_COOLDOWN_MS = 1800000; // 30 minutes
+
+function isToolCircuitOpen(toolName) {
+  var circuit = toolCircuits[toolName];
+  if (!circuit) return false;
+  if (Date.now() < circuit.openUntil) return true;
+  if (circuit.openUntil > 0 && Date.now() >= circuit.openUntil) {
+    circuit.openUntil = 0;
+    circuit.errors = [];
+    console.log('[nc] Circuit CLOSED for ' + toolName + ' (cooldown expired)');
+    emitAudit('tool.circuit_closed', { tool: toolName });
+  }
+  return false;
+}
+
+function recordToolFailure(toolName, errorCode, layer) {
+  if (!toolCircuits[toolName]) {
+    toolCircuits[toolName] = { errors: [], openUntil: 0, layer: '' };
+  }
+  var circuit = toolCircuits[toolName];
+  circuit.errors.push({ code: errorCode, time: Date.now() });
+  circuit.layer = layer;
+  if (circuit.errors.length > 10) circuit.errors = circuit.errors.slice(-10);
+  var recentSameError = circuit.errors.filter(function(e) {
+    return e.code === errorCode && (Date.now() - e.time) < 3600000;
+  });
+  if (recentSameError.length >= TOOL_CB_THRESHOLD) {
+    circuit.openUntil = Date.now() + TOOL_CB_COOLDOWN_MS;
+    console.log('[nc] Circuit OPEN for ' + toolName + ' (' + errorCode + ' x' + recentSameError.length + ')');
+    emitAudit('tool.circuit_open', {
+      tool: toolName, errorCode: errorCode, layer: layer,
+      reopenAt: new Date(circuit.openUntil).toISOString(),
+    });
+    return true;
+  }
+  return false;
+}
+
+var TOOL_ALTERNATIVES = {
+  generate_speech: ['generate_video'],
+  render_video: ['generate_content'],
+  notion_search: ['query_knowledge'],
+  generate_i2v: ['render_video'],
+  generate_tts: ['voice_response'],
+};
+
+function getToolAlternative(toolName) {
+  var alts = TOOL_ALTERNATIVES[toolName];
+  if (!alts) return null;
+  for (var i = 0; i < alts.length; i++) {
+    if (!isToolCircuitOpen(alts[i])) return alts[i];
+  }
+  return null;
 }
 
 // ============================================================================
@@ -767,16 +828,113 @@ function sanitize(str) {
 }
 
 async function executeToolCall(toolName, input, tenant, correlationId, chatId) {
+  // V12.2: Check intrinsic circuit breaker BEFORE calling tool
+  if (isToolCircuitOpen(toolName)) {
+    var alt = getToolAlternative(toolName);
+    var circuit = toolCircuits[toolName];
+    if (alt) {
+      console.log('[nc] Circuit OPEN for ' + toolName + ', routing to: ' + alt);
+      emitAudit('tool.alternative_routed', { blocked: toolName, alternative: alt, layer: circuit.layer });
+      return executeToolCall(alt, input, tenant, correlationId, chatId);
+    }
+    return {
+      error: toolName + ' is temporarily unavailable (' + circuit.layer + ' issue)',
+      layer: circuit.layer,
+      circuitOpen: true,
+      reopenAt: new Date(circuit.openUntil).toISOString(),
+      action: circuit.layer === 'context'
+        ? 'Billing/auth issue. Tell admin: top up API credit or check key.'
+        : 'Tool will auto-retry in ' + Math.round((circuit.openUntil - Date.now()) / 60000) + ' minutes.'
+    };
+  }
+
+  var _startTime = Date.now();
   try {
-  var _toolResult = await _executeToolCallInner(toolName, input, tenant, correlationId, chatId);
-  // V12: Track tool usage for experience emission
-  if (typeof toolsActuallyUsed !== 'undefined') toolsActuallyUsed.push({ name: toolName, success: true });
-  return _toolResult;
+    var _toolResult = await _executeToolCallInner(toolName, input, tenant, correlationId, chatId);
+    // V12.1: Track tool usage
+    if (typeof toolsActuallyUsed !== 'undefined') toolsActuallyUsed.push({ name: toolName, success: true });
+    // V12.2: Emit tool receipt for L2 visibility (GAP-5)
+    emitAudit('tool.receipt', {
+      tool: toolName, success: !_toolResult.error,
+      latencyMs: Date.now() - _startTime,
+      tenantId: tenant ? tenant.tenantId : null,
+      correlationId: correlationId,
+      resultSummary: _toolResult.error ? _toolResult.error.slice(0, 100) : 'ok',
+    });
+    return _toolResult;
   } catch (toolErr) {
     var errMsg = toolErr instanceof Error ? toolErr.message : String(toolErr);
-    console.error('[nc] Tool error:', toolName, errMsg.slice(0, 100));
-    emitAudit('tool.error', { tool: toolName, error: errMsg.slice(0, 200), tenantId: tenant ? tenant.tenantId : null, correlationId: correlationId });
-    return { error: 'Tool failed: ' + toolName + ' — ' + errMsg.slice(0, 80) };
+    console.error('[nc] Tool error:', toolName, errMsg.slice(0, 200));
+
+    // V12.1: 6-LAYER DIAGNOSTIC
+    var layer = 'unknown';
+    var recovery = '';
+    var errLower = errMsg.toLowerCase();
+
+    if (/enoent|spawn|execsync|child_process|eacces|eperm/.test(errLower)) {
+      layer = 'infrastructure';
+      recovery = 'A required binary or file is missing. Server admin must install dependency.';
+    } else if (/timeout|econnrefused|enotfound|socket|fetch failed|headers_timeout|econnreset/.test(errLower)) {
+      layer = 'network';
+      recovery = 'Could not reach API. Will retry once.';
+      try {
+        await new Promise(function(r) { setTimeout(r, 2000); });
+        var retryResult = await _executeToolCallInner(toolName, input, tenant, correlationId, chatId);
+        if (retryResult && !retryResult.error) {
+          console.log('[nc] Auto-retry SUCCESS for ' + toolName);
+          emitAudit('tool.receipt', { tool: toolName, success: true, latencyMs: Date.now() - _startTime, retried: true, tenantId: tenant ? tenant.tenantId : null });
+          return retryResult;
+        }
+      } catch(retryErr) { /* retry failed */ }
+    } else if (/invalid|required|missing|schema|validation|type.*error/.test(errLower)) {
+      layer = 'semantic';
+      recovery = 'Wrong input parameters. Check tool description for required fields.';
+    } else if (/unauthorized|forbidden|403|401|insufficient|balance|quota|limit|expired|1008/.test(errLower)) {
+      layer = 'context';
+      recovery = 'External billing/quota/auth issue. Cannot fix by retrying. Human must act.';
+    } else if (/reference.*not defined|is not a function|cannot read|undefined/.test(errLower)) {
+      layer = 'tool_execution';
+      recovery = 'Bug in tool code. Logged for repair team.';
+    } else {
+      layer = 'logical';
+      recovery = 'Unexpected error in data processing.';
+    }
+
+    // V12.2: Record failure for circuit breaker
+    var errorCode = (errMsg.match(/\d{3,4}/) || [layer])[0];
+    var circuitOpened = recordToolFailure(toolName, errorCode, layer);
+
+    emitAudit('tool.error', {
+      tool: toolName, error: errMsg.slice(0, 200),
+      layer: layer, recovery: recovery, circuitOpened: circuitOpened,
+      tenantId: tenant ? tenant.tenantId : null, correlationId: correlationId
+    });
+    emitAudit('tool.receipt', {
+      tool: toolName, success: false, latencyMs: Date.now() - _startTime,
+      layer: layer, tenantId: tenant ? tenant.tenantId : null,
+    });
+
+    // V12.2: If circuit just opened, suggest alternative
+    if (circuitOpened) {
+      var alt = getToolAlternative(toolName);
+      if (alt) {
+        return {
+          error: toolName + ' circuit opened after ' + TOOL_CB_THRESHOLD + ' failures. Alternative: ' + alt,
+          layer: layer, alternative: alt,
+          action: 'I will use ' + alt + ' instead. Original tool blocked for 30 minutes.'
+        };
+      }
+    }
+
+    return {
+      error: 'Tool failed: ' + toolName,
+      layer: layer,
+      diagnosis: recovery,
+      action: layer === 'network' ? 'Auto-retried once. Tell user to try again in a minute.' :
+              layer === 'context' ? 'Tell user: billing/auth issue. Admin needs to check API key or credit.' :
+              layer === 'infrastructure' ? 'Tell user: Server config issue. Repair team notified.' :
+              'Tell user what happened honestly. Do NOT say "How can I help?"'
+    };
   }
 }
 
@@ -2590,7 +2748,7 @@ http.createServer(function(req, res) {
   }
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
-    status: 'ok', agent: 'nanoclaw-v12.1.0-compositional', messages: msgCount,
+    status: 'ok', agent: 'nanoclaw-v12.2.0-flight-recorder', messages: msgCount,
     uptime: Math.round(process.uptime()),
     memory: { type: 'ESAGM', entities: Object.keys(entities).length }, // SEC-07: no patient names in health
     capabilities: ANTHROPIC_KEY ? 'tool_use+esagm' : 'gateway_only',
@@ -2608,7 +2766,7 @@ http.createServer(function(req, res) {
 
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', agent: 'nanoclaw-v12.1.0-compositional-kiosk', tools: ALL_TOOLS.length }));
+    res.end(JSON.stringify({ status: 'ok', agent: 'nanoclaw-v12.2.0-flight-recorder-kiosk', tools: ALL_TOOLS.length }));
     return;
   }
 
@@ -2628,7 +2786,7 @@ http.createServer(function(req, res) {
 }).listen(KIOSK_PORT, '0.0.0.0');
 console.log('[nc] Kiosk API on :' + KIOSK_PORT + ' (Tailscale-accessible)');
 
-console.log('[nc] NanoClaw v12.1.0-compositional on :' + HEALTH_PORT);
+console.log('[nc] NanoClaw v12.2.0-flight-recorder on :' + HEALTH_PORT);
 console.log('[nc] Persona: COS (admin) + Expert Rep (Keith Koo)');
 console.log('[nc] Memory: Entity-Scoped Attention Graph (per-patient isolation)');
 console.log('[nc] Tools: ' + (ANTHROPIC_KEY ? 'Anthropic tool_use (scoped by persona)' : 'Gateway only (no ANTHROPIC_KEY)'));
@@ -2637,6 +2795,6 @@ loadAgentIdentity().catch(function(e) { console.warn('[nc] Initial identity load
 seedBrandDNA(); // Seed DR MAGfield brand DNA into agent memory
 
 // Startup audit event
-emitAudit('nanoclaw.startup', { version: 'v12.1.0-compositional', capabilities: ANTHROPIC_KEY ? 'full' : 'gateway_only', tenantId: TENANT_ID, tenantMode: process.env.TENANT_MODE || 'single', toolCount: ALL_TOOLS.length });
+emitAudit('nanoclaw.startup', { version: 'v12.2.0-flight-recorder', capabilities: ANTHROPIC_KEY ? 'full' : 'gateway_only', tenantId: TENANT_ID, tenantMode: process.env.TENANT_MODE || 'single', toolCount: ALL_TOOLS.length });
 
 poll();
