@@ -48,7 +48,7 @@ const EXPERT_NAME = process.env.EXPERT_NAME || 'Keith Koo';
 const EXPERT_SLUG = process.env.EXPERT_SLUG || 'keith-koo';
 const HEALTH_PORT = 3002;
 const GATEWAY_TIMEOUT = 120000;
-const NANOCLAW_VERSION = 'v11.3.0-safety'; // S1-S4 safety patched
+const NANOCLAW_VERSION = 'v12.2.1-auto-onboard'; // v12.2.1: auto-onboard unknown DMs + group sender tracking
 
 if (!TG_TOKEN) { console.error('[nc] FATAL: TELEGRAM_BOT_TOKEN not set'); process.exit(1); }
 
@@ -1539,7 +1539,23 @@ async function loadAgentIdentity() {
       if (!CHAT_TENANT_MAP[magfieldGroupId]) {
         CHAT_TENANT_MAP[magfieldGroupId] = { tenantId: TENANT_ID, expertSlug: EXPERT_SLUG, expertName: EXPERT_NAME, isAdmin: false, isGroup: true };
         console.log('[nc] MAGfield group registered: ' + magfieldGroupId);
-      }
+
+      // V12.2.1: Load additional admins from gateway_config
+      if (adminAgent && adminAgent.length > 0) {
+        for (var _aai = 0; _aai < adminAgent.length; _aai++) {
+          var _aag = adminAgent[_aai];
+          if (_aag && _aag.gateway_config && _aag.gateway_config.telegram && _aag.gateway_config.telegram.additionalAdmins) {
+            var _addAdmins = _aag.gateway_config.telegram.additionalAdmins;
+            for (var _adi = 0; _adi < _addAdmins.length; _adi++) {
+              var _aa = _addAdmins[_adi];
+              if (_aa.chatId && !CHAT_TENANT_MAP[String(_aa.chatId)]) {
+                CHAT_TENANT_MAP[String(_aa.chatId)] = { tenantId: _aag.tenant_id || TENANT_ID, expertSlug: EXPERT_SLUG, expertName: _aa.name || EXPERT_NAME, isAdmin: true, role: _aa.role || "admin" };
+                console.log("[nc] Additional admin registered: " + _aa.chatId + " → " + (_aa.name || "unknown"));
+              }
+            }
+          }
+        }
+      }      }
     // Load behavioral lessons from consciousness.update events
     var lessonsUrl = SUPABASE_URL + '/rest/v1/agent_event_bus?event_type=eq.consciousness.update&status=eq.completed&tenant_id=eq.' + TENANT_ID + '&select=payload&order=created_at.desc&limit=10';
     var lessonEvents = await httpsGet(lessonsUrl, { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }, 5000).catch(function() { return []; });
@@ -2064,9 +2080,81 @@ async function handleMessage(msg) {
   var correlationId = crypto.randomUUID();
   var tenant = CHAT_TENANT_MAP[String(chatId)];
   if (!tenant) {
-    console.log('[nc] REJECTED: unauthorized chatId=' + chatId);
-    await sendTelegram(chatId, 'Not authorized. Contact admin to register your Telegram account.');
-    return;
+    // V12.2.1: AUTO-ONBOARD instead of rejecting
+    // DM from unknown user → register as Stage 1 (Anonymous) patient
+    var fromUser = msg.from || {};
+    var fromName = (fromUser.first_name || '') + (fromUser.last_name ? ' ' + fromUser.last_name : '');
+    var fromUsername = fromUser.username || '';
+    console.log('[nc] AUTO-ONBOARD: new user chatId=' + chatId + ' name=' + fromName + ' @' + fromUsername);
+
+    // Find tenant from deep-link or default to primary tenant
+    var onboardTenantId = TENANT_ID; // Default: this instance's tenant
+    // Check if /start had a tenant slug (e.g., /start drmagfield)
+    if (text && text.startsWith('/start ')) {
+      var startSlug = text.split(' ')[1];
+      // Could resolve slug → tenantId here if multi-tenant
+    }
+
+    // Register in CHAT_TENANT_MAP as non-admin
+    CHAT_TENANT_MAP[String(chatId)] = {
+      tenantId: onboardTenantId,
+      expertSlug: EXPERT_SLUG,
+      expertName: EXPERT_NAME,
+      isAdmin: false,
+      autoOnboarded: true,
+      onboardedAt: Date.now(),
+      fromName: fromName,
+      fromUsername: fromUsername,
+    };
+    tenant = CHAT_TENANT_MAP[String(chatId)];
+
+    // Emit onboard event for audit trail
+    emitAudit('acquisition.auto_onboard', {
+      chatId: String(chatId),
+      name: fromName,
+      username: fromUsername,
+      tenantId: onboardTenantId,
+      channel: 'telegram_dm',
+      trustStage: 'anonymous',
+    });
+
+    // Create patient entity in ESAGM memory
+    var entityId = 'patient:' + fromName.replace(/\s+/g, '-').toLowerCase();
+    var entity = getEntity(chatId, entityId);
+    entity.displayName = fromName || 'Unknown';
+    entity.type = 'patient';
+    entity.lastActive = Date.now();
+
+    // Cache name for system prompt
+    patientNameCache[entityId.replace('patient:', '')] = fromName || fromUsername || 'User';
+
+    // Welcome message — Progressive Trust Stage 1
+    await sendTelegram(chatId,
+      'Hi ' + (fromName.split(' ')[0] || 'there') + '! 👋\n\n' +
+      'I am the AI assistant for ' + EXPERT_NAME + '.\n\n' +
+      'How can I help you today? You can:\n' +
+      '• Ask about our therapy services\n' +
+      '• Book a session with Arie (+6012-659 5319)\n' +
+      '• Share health documents for analysis\n\n' +
+      'What brings you here?'
+    );
+
+    // Try to create patient in Mothership (non-blocking)
+    try {
+      httpsPost(MOTHERSHIP + '/api/gateway/create_patient', {
+        'X-MCP-API-Key': MCP_KEY, 'x-correlation-id': correlationId,
+      }, {
+        name: fromName || fromUsername || 'Telegram User ' + chatId,
+        tenantId: onboardTenantId,
+        source: 'telegram_auto_onboard',
+        telegramChatId: String(chatId),
+        telegramUsername: fromUsername,
+      }, 10000).catch(function(e) {
+        console.warn('[nc] Auto-onboard patient creation failed:', e.message);
+      });
+    } catch(e) {}
+
+    return; // Welcome sent, next message will flow through normal pipeline
   }
   var chat = getChat(chatId);
 
@@ -2085,6 +2173,35 @@ async function handleMessage(msg) {
   // 1. Entity resolution
   var entityId = resolveEntity(text, chat, tenant);
   switchEntity(chatId, entityId);
+
+  // V12.2.1: Track individual senders in group chats
+  var isGroup = chatId < 0;
+  if (isGroup && msg.from) {
+    var senderName = (msg.from.first_name || '') + (msg.from.last_name ? ' ' + msg.from.last_name : '');
+    var senderId = String(msg.from.id);
+    if (senderName && !patientNameCache['tg:' + senderId]) {
+      patientNameCache['tg:' + senderId] = senderName;
+      // Create entity for this group participant
+      var senderEntityId = 'patient:' + senderName.replace(/\s+/g, '-').toLowerCase();
+      var senderEntity = getEntity(chatId, senderEntityId);
+      if (!senderEntity.displayName || senderEntity.displayName === 'Unknown') {
+        senderEntity.displayName = senderName;
+        senderEntity.type = 'patient';
+        senderEntity.lastActive = Date.now();
+        senderEntity.telegramId = senderId;
+        console.log('[nc] Group sender tracked: ' + senderName + ' (tg:' + senderId + ')');
+      }
+    }
+    // Prepend sender name to system prompt context so LLM knows WHO is talking
+    if (senderName && entityId === 'system:general') {
+      entityId = 'patient:' + senderName.replace(/\s+/g, '-').toLowerCase();
+      switchEntity(chatId, entityId);
+      var sEntity = getEntity(chatId, entityId);
+      if (!sEntity.displayName || sEntity.displayName === 'Unknown') {
+        sEntity.displayName = senderName;
+      }
+    }
+  }
 
   // 2. Persona detection
   var persona = detectPersona(text, entityId, tenant);
@@ -2412,7 +2529,7 @@ http.createServer(function(req, res) {
   }
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
-    status: 'ok', agent: 'nanoclaw-v11.3.0', messages: msgCount,
+    status: 'ok', agent: 'nanoclaw-v12.2.1-auto-onboard', messages: msgCount,
     uptime: Math.round(process.uptime()),
     memory: { type: 'ESAGM', entities: Object.keys(entities).length }, // SEC-07: no patient names in health
     capabilities: ANTHROPIC_KEY ? 'tool_use+esagm' : 'gateway_only',
@@ -2430,7 +2547,7 @@ http.createServer(function(req, res) {
 
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', agent: 'nanoclaw-v11.3.0-kiosk', tools: ALL_TOOLS.length }));
+    res.end(JSON.stringify({ status: 'ok', agent: 'nanoclaw-v12.2.1-auto-onboard-kiosk', tools: ALL_TOOLS.length }));
     return;
   }
 
@@ -2450,7 +2567,7 @@ http.createServer(function(req, res) {
 }).listen(KIOSK_PORT, '0.0.0.0');
 console.log('[nc] Kiosk API on :' + KIOSK_PORT + ' (Tailscale-accessible)');
 
-console.log('[nc] NanoClaw v11.3.0 on :' + HEALTH_PORT);
+console.log('[nc] NanoClaw v12.2.1-auto-onboard on :' + HEALTH_PORT);
 console.log('[nc] Persona: COS (admin) + Expert Rep (Keith Koo)');
 console.log('[nc] Memory: Entity-Scoped Attention Graph (per-patient isolation)');
 console.log('[nc] Tools: ' + (ANTHROPIC_KEY ? 'Anthropic tool_use (scoped by persona)' : 'Gateway only (no ANTHROPIC_KEY)'));
@@ -2459,6 +2576,6 @@ loadAgentIdentity().catch(function(e) { console.warn('[nc] Initial identity load
 seedBrandDNA(); // Seed DR MAGfield brand DNA into agent memory
 
 // Startup audit event
-emitAudit('nanoclaw.startup', { version: 'v11.3.0', capabilities: ANTHROPIC_KEY ? 'full' : 'gateway_only', tenantId: TENANT_ID, tenantMode: process.env.TENANT_MODE || 'single', toolCount: ALL_TOOLS.length });
+emitAudit('nanoclaw.startup', { version: 'v12.2.1-auto-onboard', capabilities: ANTHROPIC_KEY ? 'full' : 'gateway_only', tenantId: TENANT_ID, tenantMode: process.env.TENANT_MODE || 'single', toolCount: ALL_TOOLS.length });
 
 poll();
