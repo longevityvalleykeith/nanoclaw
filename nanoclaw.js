@@ -49,7 +49,7 @@ const EXPERT_NAME = process.env.EXPERT_NAME || 'Keith Koo';
 const EXPERT_SLUG = process.env.EXPERT_SLUG || 'keith-koo';
 const HEALTH_PORT = 3002;
 const GATEWAY_TIMEOUT = 120000;
-const NANOCLAW_VERSION = 'v12.3.0-social-consciousness'; // v12.3: social awareness + conservation check + L1 entity coupling + Mac Mini mutations merged
+const NANOCLAW_VERSION = 'v12.5.0-self-reflection'; // v12.5: self-reflection + autonomy rules + notion_write auto-routing + extract_image_text + composio_action + flight recorder introspection
 
 if (!TG_TOKEN) { console.error('[nc] FATAL: TELEGRAM_BOT_TOKEN not set'); process.exit(1); }
 
@@ -113,6 +113,47 @@ function gracefulShutdown(signal) {
 }
 process.on('SIGTERM', function() { gracefulShutdown('SIGTERM'); });
 process.on('SIGINT', function() { gracefulShutdown('SIGINT'); });
+
+// ============================================================================
+// V12.4: CLAUDE ARCHITECTURE PATTERNS (5 patterns from source analysis)
+// ============================================================================
+
+// Pattern 1: BLOCKING BUDGET — rate-limit proactive messages
+// 15-second window, max 2 proactive messages per window
+// Reactive (user-initiated) messages bypass budget entirely
+var proactiveBudget = { windowStart: 0, count: 0, WINDOW_MS: 15000, MAX_PER_WINDOW: 2 };
+function canSendProactive() {
+  var now = Date.now();
+  if (now - proactiveBudget.windowStart > proactiveBudget.WINDOW_MS) {
+    proactiveBudget.windowStart = now;
+    proactiveBudget.count = 0;
+  }
+  if (proactiveBudget.count >= proactiveBudget.MAX_PER_WINDOW) return false;
+  proactiveBudget.count++;
+  return true;
+}
+
+// Pattern 2: SKEPTICAL MEMORY — memory is a hint, codebase is truth
+// Before acting on stored context, verify against live data
+// Implemented in consciousness loader: "verify before acting" directive
+
+// Pattern 3: SEMANTIC MEMORY MERGING — consolidate contradictions
+// Implemented via HACPO learning loop (consciousnessLessons dedup)
+// autoDream-equivalent: nightly consciousness.update events merge behavioral rules
+
+// Pattern 4: ADVERSARIAL VERIFICATION — separate agent verifies work
+// Implemented via tool.receipt + convergence_finding events
+// Recovery Midfielder acts as adversarial verifier
+
+// Pattern 5: PROMPT CACHE AWARENESS — minimize cache-break vectors
+// Track when system prompt changes to avoid unnecessary cache invalidation
+var lastPromptHash = '';
+function promptChanged(newPrompt) {
+  var hash = require('crypto').createHash('md5').update(newPrompt).digest('hex');
+  if (hash === lastPromptHash) return false;
+  lastPromptHash = hash;
+  return true;
+}
 
 // ============================================================================
 // S3: CIRCUIT BREAKER ON MOTHERSHIP GATEWAY
@@ -838,14 +879,15 @@ var ALL_TOOLS = [
   { name: 'event_campaign', description: 'Create content campaign for a KRPM golf event. Generates schedule: T-7 hype, T-1 reminder, T-0 event day, T+1 recap. Admin-only.', input_schema: { type: 'object', properties: { name: { type: 'string', description: 'Event name' }, date: { type: 'string', description: 'Event date YYYY-MM-DD' }, offer: { type: 'string', description: 'Special offer' } }, required: ['name', 'date'] } },
   { name: 'render_video', description: 'Render Content Atom as MP4 video using Remotion and send to current Telegram chat. Supports brand image overlay. Returns video file path and sends to user.', input_schema: { type: 'object', properties: { headline: { type: 'string', description: 'Video headline' }, body: { type: 'string', description: 'Body text' }, cta: { type: 'string', description: 'CTA text' }, imageUrl: { type: 'string', description: 'Public URL of hero/product image (from upload_media)' }, type: { type: 'string', description: 'Content type' }, product: { type: 'string', description: 'Product name' }, eventName: { type: 'string', description: 'Event name' }, eventDate: { type: 'string', description: 'Event date' } }, required: ['headline'] } },
   // === INTEGRATIONS (Google Calendar + Drive + Notion) ===
-  { name: 'create_calendar_event', description: 'Create a Google Calendar event. Use for scheduling sessions, appointments, follow-ups. Returns event link.', input_schema: { type: 'object', properties: { title: { type: 'string', description: 'Event title' }, startTime: { type: 'string', description: 'ISO 8601 start (e.g. 2026-04-05T09:00:00+08:00)' }, endTime: { type: 'string', description: 'ISO 8601 end' }, description: { type: 'string', description: 'Event description' }, location: { type: 'string', description: 'Location (e.g. KRPM Experience Lounge)' } }, required: ['title', 'startTime', 'endTime'] } },
-  { name: 'read_drive_file', description: 'Read a file from Google Drive. Returns file content. Use when admin asks to check a shared document.', input_schema: { type: 'object', properties: { fileId: { type: 'string', description: 'Google Drive file ID' }, fileName: { type: 'string', description: 'File name to search for' } }, required: ['fileId'] } },
-  { name: 'sync_google_drive', description: 'Sync Google Drive folder to knowledge base. Imports documents as KUs.', input_schema: { type: 'object', properties: { folderId: { type: 'string', description: 'Drive folder ID to sync' } }, required: [] } },
+  // REMOVED: create_calendar_event, read_drive_file, sync_google_drive (replaced by composio_action)
+  // Use: composio_action({ action: "GOOGLECALENDAR_CREATE_EVENT" }) instead of create_calendar_event
+  // Use: composio_action({ action: "GOOGLEDRIVE_FIND_FILE" }) instead of read_drive_file
+  // Use: composio_action({ action: "GOOGLEDRIVE_LIST_FILES" }) instead of sync_google_drive
   { name: 'notion_search', description: 'Search Notion workspace. Find pages, databases, events, patient notes. Use when admin asks about Notion content.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Search query' } }, required: ['query'] } },
   { name: 'notion_fetch', description: 'Fetch full content of a Notion page by URL or ID. Use after notion_search to get details.', input_schema: { type: 'object', properties: { pageId: { type: 'string', description: 'Notion page ID or URL' } }, required: ['pageId'] } },
+  { name: 'notion_write', description: 'Create or update a Notion page. AUTO-ROUTES: tries Composio Notion first, falls back to saving in Supabase knowledge base if Notion not connected. NEVER say you cant write to Notion — this tool handles the fallback automatically.', input_schema: { type: 'object', properties: { title: { type: 'string', description: 'Page title' }, content: { type: 'string', description: 'Page content (markdown)' }, params: { type: 'object', description: 'Additional Notion page properties' } }, required: ['title', 'content'] } },
   // === CLINICAL TOOLS (gateway proxy) ===
-  { name: 'manage_integrations', description: 'Connect or check OAuth services (Notion, Calendar, Drive). Use when user asks to connect a service.', input_schema: { type: 'object', properties: { action: { type: 'string', enum: ['connect', 'status', 'disconnect'] }, toolkit: { type: 'string', description: 'notion, googlecalendar, googledrive, stripe, gmail' } }, required: ['action'] } },
-  { name: 'composio_tool', description: 'Execute Composio-connected service action. Use after manage_integrations confirms connection.', input_schema: { type: 'object', properties: { toolkit: { type: 'string' }, action: { type: 'string' }, params: { type: 'object' } }, required: ['toolkit', 'action'] } },
+  // REMOVED: manage_integrations + composio_tool (replaced by composio_action — direct API, no Mothership proxy)
   { name: 'get_daily_brief', description: 'Get daily patient brief — summary of today scheduled patients, follow-ups due, alerts.', input_schema: { type: 'object', properties: {} } },
   { name: 'get_patient_insights', description: 'Get AI insights for a specific patient — health trends, risk factors, recommendations.', input_schema: { type: 'object', properties: { patientName: { type: 'string', description: 'Patient name' } }, required: ['patientName'] } },
   { name: 'escalate_emergency', description: 'Escalate a medical emergency. Sends alert to expert + admin + emergency contacts.', input_schema: { type: 'object', properties: { patientName: { type: 'string', description: 'Patient name' }, situation: { type: 'string', description: 'Emergency description' }, severity: { type: 'string', enum: ['urgent', 'critical', 'life-threatening'], description: 'Severity level' } }, required: ['situation', 'severity'] } },
@@ -858,9 +900,14 @@ var ALL_TOOLS = [
   { name: 'process_expert_queue', description: 'Approve or reject an expert queue item. Admin-only.', input_schema: { type: 'object', properties: { itemId: { type: 'string' }, action: { type: 'string', enum: ['approve', 'reject'] }, notes: { type: 'string' } }, required: ['itemId', 'action'] } },
   // === Sook Ping workflow tools (merge arbiter Task 4) ===
   { name: 'import_document', description: 'Import a clinical document (physiotherapy report, service summary, lab report). Extracts patient name + clinical data, creates patient entity, returns structured summary. Use AFTER receiving a document upload — call with the file_id from the upload. This is the PRIMARY tool for document-to-entity conversion.', input_schema: { type: 'object', properties: { file_id: { type: 'string', description: 'Telegram file_id of the uploaded document' }, document_type: { type: 'string', enum: ['physiotherapy_report', 'service_summary', 'lab_report', 'intake_form', 'other'], description: 'Type of clinical document' }, patient_name: { type: 'string', description: 'Patient name if already known (optional — will extract from document if not provided)' } }, required: ['file_id'] } },
+  { name: 'extract_image_text', description: 'Extract text from an image (IC card, lab report photo, document scan). Downloads from Google Drive via Composio then uses Gemini vision to OCR/extract text. Use for reading NRIC from IC cards, extracting data from photos of documents, or any image-to-text conversion. Returns extracted text + structured data.', input_schema: { type: 'object', properties: { file_id: { type: 'string', description: 'Google Drive file ID of the image' }, extraction_type: { type: 'string', enum: ['ic_card', 'lab_report', 'document_scan', 'general'], description: 'What to extract (default: general)' }, file_url: { type: 'string', description: 'Direct URL to image (alternative to file_id)' } }, required: [] } },
   { name: 'manage_session', description: 'Record a session from natural language. Parse "Done with Auntie Lim, housecall companion 4 hours, RM200" into structured session record. Creates patient if needed, records session, calculates revenue.', input_schema: { type: 'object', properties: { description: { type: 'string', description: 'Natural language session description (e.g., "Done with Auntie Lim, housecall companion 4 hours, RM200")' } }, required: ['description'] } },
   { name: 'generate_invoice', description: 'Generate Malaysia-compliant e-invoice for a completed session. Creates invoice with line items, SST-exempt tax, revenue split. Returns invoice number + verify URL. Use AFTER manage_session or record_session.', input_schema: { type: 'object', properties: { patientName: { type: 'string', description: 'Patient/client name' }, serviceType: { type: 'string', enum: ['housecall_1hr', 'housecall_companion', 'lm_physio', 'lm_housecall', 'lm_monthly'], description: 'Service type' }, hours: { type: 'number', description: 'Number of hours (default 1)' }, rate: { type: 'number', description: 'Override rate in RM' }, facilityName: { type: 'string', description: 'Partnering facility name (if applicable)' }, facilitySharePct: { type: 'number', description: 'Facility share % (default 20)' }, notes: { type: 'string', description: 'Additional notes' } }, required: ['patientName', 'serviceType'] } },
   { name: 'create_payment_link', description: 'Create Airwallex payment link for an invoice. Returns secure FPX/card payment URL + verification URL. Send to patient/family. Use AFTER generate_invoice.', input_schema: { type: 'object', properties: { invoiceId: { type: 'string', description: 'Invoice ID or invoice number (e.g., PC-INV-2026-0042)' } }, required: ['invoiceId'] } },
+  // === VM CLI ACCESS — Agent 0 self-management ===
+  { name: 'run_cli', description: 'Execute a safe CLI command on this VM. Allowed: composio, npm, npx, node, pip, python3, pandoc, git, curl, ls, cat, grep, find, ps, df. Admin-only. Use for self-installing tools, checking status, running OAuth flows. NOT for destructive operations.', input_schema: { type: 'object', properties: { command: { type: 'string', description: 'Shell command (must use allowed binaries)' }, timeout: { type: 'number', description: 'Timeout seconds (default 30, max 120)' } }, required: ['command'] } },
+  // === COMPOSIO: Universal integration tool (Google Drive, Gmail, Calendar, Sheets, Notion, Facebook, Outlook) ===
+  { name: 'composio_action', description: 'THE integration tool for ALL Google/Notion/Outlook services. Actions: GOOGLEDRIVE_LIST_FILES (list files), GOOGLEDRIVE_FIND_FILE (search by name, params: {file_name}), GOOGLEDRIVE_DOWNLOAD_FILE (read/download file, params: {file_id}), GMAIL_FETCH_EMAILS (list emails, params: {max_results}), GMAIL_SEND_EMAIL (send, params: {recipient_email, subject, message_body}), GMAIL_GET_PROFILE (get email address), GOOGLECALENDAR_CREATE_EVENT (params: {summary, start_datetime, end_datetime, location}), GOOGLECALENDAR_FIND_EVENT (params: {query}). IMPORTANT: For reading file content use GOOGLEDRIVE_DOWNLOAD_FILE not GET_FILE_CONTENT. Never use run_cli curl for Drive downloads.', input_schema: { type: 'object', properties: { action: { type: 'string', description: 'GOOGLEDRIVE_LIST_FILES, GOOGLEDRIVE_FIND_FILE, GOOGLEDRIVE_DOWNLOAD_FILE, GMAIL_FETCH_EMAILS, GMAIL_SEND_EMAIL, GMAIL_GET_PROFILE, GOOGLECALENDAR_CREATE_EVENT, GOOGLECALENDAR_FIND_EVENT' }, params: { type: 'object', description: 'Action parameters' }, app: { type: 'string', description: 'googledrive, gmail, googlecalendar, googlesheets, googledocs, outlook, facebook' } }, required: ['action'] } },
 ];
 
 // Scope by persona
@@ -898,7 +945,8 @@ async function executeToolCall(toolName, input, tenant, correlationId, chatId) {
   try {
     var _toolResult = await _executeToolCallInner(toolName, input, tenant, correlationId, chatId);
     // V12.1: Track tool usage
-    if (typeof toolsActuallyUsed !== 'undefined') toolsActuallyUsed.push({ name: toolName, success: true });
+    // V12.5: Use global _globalToolsUsed (executeToolCall can't close over handleMessage scope)
+    _globalToolsUsed.push({ name: toolName, success: true });
     // V12.2: Emit tool receipt for L2 visibility (GAP-5)
     emitAudit('tool.receipt', {
       tool: toolName, success: !_toolResult.error,
@@ -1376,23 +1424,8 @@ async function _executeToolCallInner(toolName, input, tenant, correlationId, cha
     }
 
     // === INTEGRATION TOOLS (gateway proxy) ===
-    case 'create_calendar_event':
-      return httpsPost(MOTHERSHIP + '/api/gateway/create_calendar_event', gwHeaders, {
-        title: input.title, startTime: input.startTime, endTime: input.endTime,
-        description: input.description || '', location: input.location || '',
-        tenantId: tenant.tenantId, expertSlug: tenant.expertSlug,
-      }, 15000);
-
-    case 'read_drive_file':
-      return httpsPost(MOTHERSHIP + '/api/gateway/read_drive_file', gwHeaders, {
-        fileId: input.fileId, fileName: input.fileName,
-        tenantId: tenant.tenantId,
-      }, 30000);
-
-    case 'sync_google_drive':
-      return httpsPost(MOTHERSHIP + '/api/gateway/sync_google_drive', gwHeaders, {
-        folderId: input.folderId, tenantId: tenant.tenantId,
-      }, 60000);
+    // REMOVED: create_calendar_event, read_drive_file, sync_google_drive handlers
+    // All Google integration now via composio_action (direct API, no Mothership proxy)
 
     case 'notion_search':
       return httpsPost(MOTHERSHIP + '/api/gateway/notion_search', gwHeaders, {
@@ -1403,6 +1436,50 @@ async function _executeToolCallInner(toolName, input, tenant, correlationId, cha
       return httpsPost(MOTHERSHIP + '/api/gateway/notion_fetch', gwHeaders, {
         pageId: input.pageId,
       }, 15000);
+
+    // === AUTO-ROUTING: Notion write — tries Composio, falls back to Supabase ===
+    case 'notion_write': {
+      var composioKey3 = process.env.COMPOSIO_API_KEY;
+      var writeResult = null;
+      // Try 1: Composio NOTION_CREATE_A_PAGE
+      if (composioKey3) {
+        try {
+          var notionAccounts = { notion: null }; // Will be populated when Notion OAuth connected
+          // Try to find Notion connected account dynamically
+          var connList = await httpsPost('https://backend.composio.dev/api/v1/connectedAccounts',
+            { 'x-api-key': composioKey3 }, {}, 5000).catch(function() { return { items: [] }; });
+          var notionConn = null;
+          if (connList && connList.items) {
+            for (var ci = 0; ci < connList.items.length; ci++) {
+              if (connList.items[ci].appName === 'notion' && connList.items[ci].status === 'ACTIVE') {
+                notionConn = connList.items[ci].id;
+                break;
+              }
+            }
+          }
+          if (notionConn) {
+            writeResult = await httpsPost('https://backend.composio.dev/api/v2/actions/NOTION_CREATE_A_PAGE/execute',
+              { 'x-api-key': composioKey3, 'Content-Type': 'application/json' },
+              { connectedAccountId: notionConn, input: input.params || { title: input.title, content: input.content } }, 15000);
+            if (writeResult && writeResult.successful) {
+              return { success: true, method: 'composio_notion', data: writeResult.data };
+            }
+          }
+        } catch(nwErr) { /* Composio failed, fall through */ }
+      }
+      // Try 2: Store in Supabase knowledge base as fallback
+      try {
+        var kbResult = await httpsPost(MOTHERSHIP + '/api/gateway/populate_knowledge', gwHeaders, {
+          title: input.title || 'Notion Page',
+          content: input.content || JSON.stringify(input.params || {}),
+          category: 'notion_pending_sync',
+          tenantId: tenant.tenantId,
+        }, 15000);
+        return { success: true, method: 'supabase_fallback', message: 'Saved to knowledge base. Will sync to Notion when OAuth is connected.', data: kbResult };
+      } catch(fbErr) {
+        return { error: 'Both Notion (Composio) and Supabase fallback failed', composio: writeResult ? 'no Notion connection' : 'no API key', supabase: (fbErr.message || '').slice(0, 100) };
+      }
+    }
 
     case 'get_daily_brief':
       return httpsPost(MOTHERSHIP + '/api/gateway/get_daily_brief', gwHeaders, {
@@ -1486,8 +1563,7 @@ async function _executeToolCallInner(toolName, input, tenant, correlationId, cha
       return httpsPost(MOTHERSHIP + '/api/gateway/generate_document', gwHeaders, input, 15000);
     case 'calculate_revenue_split':
       return httpsPost(MOTHERSHIP + '/api/gateway/calculate_revenue_split', gwHeaders, input, 10000);
-    case 'manage_integrations':
-      return httpsPost(MOTHERSHIP + '/api/gateway/manage_integrations', gwHeaders, input, 15000);
+    // REMOVED: manage_integrations handler (replaced by composio_action)
     case 'composio_tool':
       return httpsPost(MOTHERSHIP + '/api/gateway/composio_tool', gwHeaders, input, 30000);
     case 'get_expert_queue':
@@ -1639,6 +1715,65 @@ async function _executeToolCallInner(toolName, input, tenant, correlationId, cha
       };
     }
 
+    // === Image text extraction (IC cards, lab reports, document scans) ===
+    case 'extract_image_text': {
+      var geminiKey3 = process.env.GOOGLE_AI_API_KEY;
+      if (!geminiKey3) return { error: 'No GOOGLE_AI_API_KEY' };
+      var imgUrl = input.file_url || '';
+      // If file_id provided, download via Composio first
+      if (input.file_id && !imgUrl) {
+        var composioKey2 = process.env.COMPOSIO_API_KEY;
+        if (!composioKey2) return { error: 'No COMPOSIO_API_KEY for Drive download' };
+        var composioAccounts2 = { googledrive: '21d95aae-d22d-4cce-8db3-7d01cc7b6543' };
+        try {
+          var dlResult = await httpsPost('https://backend.composio.dev/api/v2/actions/GOOGLEDRIVE_DOWNLOAD_FILE/execute',
+            { 'x-api-key': composioKey2, 'Content-Type': 'application/json' },
+            { connectedAccountId: composioAccounts2.googledrive, input: { file_id: input.file_id } }, 20000);
+          if (dlResult && dlResult.successful && dlResult.data && dlResult.data.downloaded_file_content) {
+            imgUrl = dlResult.data.downloaded_file_content.s3url;
+          }
+        } catch(dlErr) { return { error: 'Drive download failed: ' + (dlErr.message || '').slice(0, 100) }; }
+      }
+      if (!imgUrl) return { error: 'No image URL. Provide file_id (Drive) or file_url (direct link).' };
+      // Download image to buffer
+      var imgBuffer = await new Promise(function(resolve, reject) {
+        https.get(imgUrl, function(res) {
+          var chunks = [];
+          res.on('data', function(c) { chunks.push(c); });
+          res.on('end', function() { resolve(Buffer.concat(chunks)); });
+          res.on('error', reject);
+        }).on('error', reject);
+      });
+      // Send to Gemini vision for extraction
+      var extractType = input.extraction_type || 'general';
+      var visionPrompt = extractType === 'ic_card'
+        ? 'This is a Malaysian IC (MyKad/MyPR) card image. Extract: full name, NRIC number (format: XXXXXX-XX-XXXX), date of birth, gender, address. Return JSON: {"name": "...", "nric": "...", "dob": "YYYY-MM-DD", "gender": "male/female", "address": "..."}'
+        : extractType === 'lab_report'
+        ? 'Extract ALL biomarker values from this lab report image. Return JSON with each test name, value, unit, and reference range.'
+        : 'Extract ALL text and structured data from this image. Return the content as structured JSON.';
+      var visionResult = await httpsPost(
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' + geminiKey3,
+        { 'Content-Type': 'application/json' },
+        { contents: [{ parts: [
+          { text: visionPrompt },
+          { inline_data: { mime_type: 'image/jpeg', data: imgBuffer.toString('base64') } }
+        ] }], generationConfig: { temperature: 0.1, maxOutputTokens: 4096 } },
+        30000
+      );
+      var visionText = visionResult && visionResult.candidates && visionResult.candidates[0]
+        && visionResult.candidates[0].content && visionResult.candidates[0].content.parts
+        && visionResult.candidates[0].content.parts[0] && visionResult.candidates[0].content.parts[0].text;
+      if (!visionText) return { error: 'Gemini vision returned empty' };
+      // Parse JSON if present
+      var extractedData = {};
+      try {
+        var jm = visionText.match(/\{[\s\S]*\}/);
+        if (jm) extractedData = JSON.parse(jm[0]);
+      } catch(pe) { extractedData = { raw_text: visionText }; }
+      emitAudit('image.text_extracted', { type: extractType, fileId: input.file_id, tenantId: tenant.tenantId, fieldsFound: Object.keys(extractedData).length });
+      return { success: true, extracted: extractedData, raw_text: visionText.slice(0, 2000), extraction_type: extractType };
+    }
+
     // === Sook Ping workflow: manage_session ===
     case 'manage_session': {
       if (!input.description) return { error: 'description required' };
@@ -1706,6 +1841,114 @@ async function _executeToolCallInner(toolName, input, tenant, correlationId, cha
         tenantId: tenant.tenantId,
       }, 15000);
 
+    // === VM CLI ACCESS — Agent 0 self-management ===
+    case 'run_cli': {
+      if (!tenant.isAdmin) return { error: 'Admin only — CLI access restricted' };
+      var cmd = input.command || '';
+      var allowedBins = ['composio', 'npm', 'npx', 'node', 'pip', 'pip3', 'python3', 'pandoc', 'git', 'curl', 'wget', 'ls', 'cat', 'grep', 'find', 'wc', 'head', 'tail', 'echo', 'which', 'ps', 'df', 'uname', 'date', 'whoami', 'env'];
+      var blockedPatterns = /rm\s+-rf|mkfs|dd\s+if|shutdown|reboot|kill\s+-9\s+1\b|>\s*\/dev|format\s+|passwd|chmod\s+777/i;
+      if (blockedPatterns.test(cmd)) {
+        return { error: 'BLOCKED: destructive command. Not allowed.' };
+      }
+      var firstBin = cmd.trim().split(/\s+/)[0].split('/').pop();
+      if (allowedBins.indexOf(firstBin) === -1 && !cmd.startsWith('export ') && !cmd.startsWith('cd ') && !cmd.startsWith('source ')) {
+        return { error: 'Binary not in allowlist: ' + firstBin + '. Allowed: ' + allowedBins.slice(0, 10).join(', ') + '...' };
+      }
+      var cliTimeout = Math.min((input.timeout || 30) * 1000, 120000);
+      try {
+        var { execSync } = require('child_process');
+        var cliResult = execSync(cmd, { timeout: cliTimeout, encoding: 'utf8', stdio: 'pipe', env: Object.assign({}, process.env, { PATH: '/usr/local/bin:/usr/bin:/bin:' + (process.env.PATH || '') }) });
+        emitAudit('agent.cli_executed', { command: cmd.slice(0, 200), exitCode: 0, outputLength: cliResult.length, tenantId: tenant.tenantId });
+        return { success: true, output: cliResult.slice(0, 4000), command: cmd };
+      } catch (cliErr) {
+        emitAudit('agent.cli_failed', { command: cmd.slice(0, 200), error: (cliErr.message || '').slice(0, 200), tenantId: tenant.tenantId });
+        return { error: 'Command failed: ' + (cliErr.message || '').slice(0, 300), stderr: (cliErr.stderr || '').slice(0, 1000), stdout: (cliErr.stdout || '').slice(0, 1000) };
+      }
+    }
+
+    // === COMPOSIO: Universal integration action ===
+    case 'composio_action': {
+      var composioKey = process.env.COMPOSIO_API_KEY;
+      if (!composioKey) return { error: 'COMPOSIO_API_KEY not set. Ask admin to configure.' };
+      var actionName = (input.action || '').toUpperCase();
+      if (!actionName) return { error: 'action required (e.g., GOOGLEDRIVE_LIST_FILES)' };
+      // Map app names to connected account IDs
+      var composioAccounts = {
+        googledrive: '21d95aae-d22d-4cce-8db3-7d01cc7b6543',
+        gmail: '13127958-a973-4201-8391-aed53e7f37a8',
+        googlecalendar: 'aa8e6686-52ec-407c-bb5e-0e83cf91b97b',
+        googlesheets: 'b92b3f5c-4b0c-439e-8a1f-22fb8dd0c9c7',
+        googledocs: '6154fc1a-c159-4584-9245-911fb39c7367',
+        outlook: 'b4bb4222-7921-4a6d-baa3-a7139d4b2444',
+        facebook: '35fec390-6f66-4a0a-9953-1883ee9d40a6',
+        notion: null, // Not yet connected — will add when OAuth'd
+      };
+      // Auto-detect app from action name
+      var appName = input.app || '';
+      if (!appName) {
+        if (actionName.startsWith('GOOGLEDRIVE')) appName = 'googledrive';
+        else if (actionName.startsWith('GMAIL')) appName = 'gmail';
+        else if (actionName.startsWith('GOOGLECALENDAR')) appName = 'googlecalendar';
+        else if (actionName.startsWith('GOOGLESHEETS')) appName = 'googlesheets';
+        else if (actionName.startsWith('GOOGLEDOCS')) appName = 'googledocs';
+        else if (actionName.startsWith('NOTION')) appName = 'notion';
+        else if (actionName.startsWith('OUTLOOK')) appName = 'outlook';
+        else if (actionName.startsWith('FACEBOOK')) appName = 'facebook';
+      }
+      var connectedAccountId = composioAccounts[appName];
+      if (!connectedAccountId && appName !== 'notion') {
+        return { error: 'No connected account for app: ' + appName + '. Available: ' + Object.keys(composioAccounts).filter(function(k) { return composioAccounts[k]; }).join(', ') };
+      }
+      // Execute via Composio REST API
+      var composioBody = { input: input.params || {} };
+      if (connectedAccountId) composioBody.connectedAccountId = connectedAccountId;
+      try {
+        var composioResult = await httpsPost(
+          'https://backend.composio.dev/api/v2/actions/' + actionName + '/execute',
+          { 'x-api-key': composioKey, 'Content-Type': 'application/json' },
+          composioBody,
+          30000
+        );
+        emitAudit('composio.action', { action: actionName, app: appName, success: !!(composioResult && composioResult.successful), tenantId: tenant.tenantId });
+        if (composioResult && (composioResult.successful || composioResult.successfull)) {
+          // Trim response for LLM readability — remove pagination tokens, logs, metadata
+          var cleanData = composioResult.data || {};
+          // Google Drive: simplify file list
+          if (cleanData.files && Array.isArray(cleanData.files)) {
+            cleanData = { files: cleanData.files.map(function(f) { return { name: f.name, id: f.id, type: f.mimeType, modifiedTime: f.modifiedTime }; }) };
+          }
+          // Gmail: simplify message list
+          if (cleanData.messages && Array.isArray(cleanData.messages)) {
+            cleanData = { messages: cleanData.messages.map(function(m) { return { id: m.id, snippet: (m.snippet || '').slice(0, 100), from: m.from, subject: m.subject, date: m.date }; }) };
+          }
+          // Calendar: simplify events
+          if (cleanData.items && Array.isArray(cleanData.items)) {
+            cleanData = { events: cleanData.items.map(function(e) { return { title: e.summary, start: e.start, end: e.end, location: e.location }; }) };
+          }
+          // Remove noise fields
+          delete cleanData.nextPageToken;
+          delete cleanData.kind;
+          delete cleanData.incompleteSearch;
+          // Convert to markdown table for maximum LLM readability + minimum tokens
+          var mdSummary = '';
+          if (cleanData.files) {
+            mdSummary = 'Google Drive Files:\n| # | Name | Type |\n|---|---|---|\n';
+            cleanData.files.forEach(function(f, i) { mdSummary += '| ' + (i+1) + ' | ' + (f.name || '?') + ' | ' + ((f.type || '').split('/').pop()) + ' |\n'; });
+          } else if (cleanData.messages) {
+            mdSummary = 'Gmail Messages:\n| # | From | Subject |\n|---|---|---|\n';
+            cleanData.messages.forEach(function(m, i) { mdSummary += '| ' + (i+1) + ' | ' + (m.from || '?').slice(0, 30) + ' | ' + (m.subject || m.snippet || '?').slice(0, 40) + ' |\n'; });
+          } else if (cleanData.events) {
+            mdSummary = 'Calendar Events:\n| # | Title | Start | Location |\n|---|---|---|---|\n';
+            cleanData.events.forEach(function(e, i) { var s = e.start ? (e.start.dateTime || e.start.date || '') : ''; mdSummary += '| ' + (i+1) + ' | ' + (e.title || '?') + ' | ' + s.slice(0, 16) + ' | ' + (e.location || '-') + ' |\n'; });
+          }
+          return { success: true, data: cleanData, summary: mdSummary || null, action: actionName, app: appName };
+        }
+        return { error: 'Action failed: ' + JSON.stringify(composioResult).slice(0, 500), action: actionName };
+      } catch (compErr) {
+        return { error: 'Composio API error: ' + (compErr.message || '').slice(0, 200), action: actionName };
+      }
+    }
+
     default:
       return Promise.resolve({ error: 'Unknown tool: ' + toolName });
   }
@@ -1727,6 +1970,61 @@ function recordFlight(event, toolName, data, tenantId, corrId) {
 // ============================================================================
 // SYSTEM PROMPT BUILDER (entity-scoped)
 // ============================================================================
+// ============================================================================
+// V12.5: SELF-REFLECTION — Agent 0 reads its own flight recorder
+// Before every response, reads last N tool events to understand:
+// - What tools succeeded (don't retry what works)
+// - What tools failed (don't retry the same way)
+// - What patterns emerge (all Notion fails = OAuth issue, skip Notion)
+// ============================================================================
+var _recentFlightCache = { events: [], lastFetch: 0 };
+
+async function selfReflect(tenantId) {
+  // Cache for 60 seconds to avoid hammering Supabase
+  if (Date.now() - _recentFlightCache.lastFetch < 60000 && _recentFlightCache.events.length > 0) {
+    return _recentFlightCache.events;
+  }
+  if (!SUPABASE_URL || !SUPABASE_KEY) return [];
+  try {
+    var url = SUPABASE_URL + '/rest/v1/agent_event_bus'
+      + '?event_type=in.(tool.receipt,tool.error,tool.circuit_open,composio.action)'
+      + '&tenant_id=eq.' + tenantId
+      + '&order=created_at.desc&limit=10&select=event_type,payload,created_at';
+    var events = await httpsGet(url, { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }, 5000);
+    if (events && Array.isArray(events)) {
+      _recentFlightCache.events = events;
+      _recentFlightCache.lastFetch = Date.now();
+      return events;
+    }
+  } catch(e) { /* non-blocking */ }
+  return [];
+}
+
+function formatFlightDigest(events) {
+  if (!events || events.length === 0) return '';
+  var succeeded = [];
+  var failed = [];
+  var circuitOpen = [];
+  for (var i = 0; i < events.length; i++) {
+    var ev = events[i];
+    var tool = ev.payload ? (ev.payload.tool || ev.payload.action || '?') : '?';
+    var layer = ev.payload ? (ev.payload.layer || '') : '';
+    if (ev.event_type === 'tool.circuit_open') {
+      circuitOpen.push(tool + ' (blocked: ' + layer + ')');
+    } else if (ev.event_type === 'tool.error' || (ev.payload && ev.payload.success === false)) {
+      failed.push(tool + (layer ? ' [' + layer + ']' : ''));
+    } else {
+      succeeded.push(tool);
+    }
+  }
+  var digest = '=== YOUR RECENT TOOL HISTORY (self-reflection) ===\n';
+  if (circuitOpen.length > 0) digest += 'CIRCUIT OPEN (do NOT call these): ' + circuitOpen.join(', ') + '\n';
+  if (failed.length > 0) digest += 'RECENTLY FAILED: ' + failed.join(', ') + ' — try alternatives\n';
+  if (succeeded.length > 0) digest += 'RECENTLY SUCCEEDED: ' + [...new Set(succeeded)].join(', ') + ' — safe to use\n';
+  digest += '=== END SELF-REFLECTION ===\n\n';
+  return digest;
+}
+
 function buildSystemPrompt(persona, entityId, chatId, tenant) {
   var entity = getEntity(chatId, entityId);
   var isGroup = chatId < 0;
@@ -1744,6 +2042,19 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
   }
   if (agentConsciousness && agentConsciousness.behavior) {
     sys += 'BEHAVIOR: ' + agentConsciousness.behavior + '\n';
+  }
+  // V12.4: Graph garden context from consciousness endpoint
+  if (agentConsciousness && agentConsciousness.topRules && agentConsciousness.topRules.length > 0) {
+    sys += "YOUR KNOWLEDGE (" + agentConsciousness.topRules.length + " rules):\n";
+    for (var _ri = 0; _ri < Math.min(agentConsciousness.topRules.length, 3); _ri++) {
+      sys += "- " + agentConsciousness.topRules[_ri].title + "\n";
+    }
+  }
+  if (agentConsciousness && agentConsciousness.toolFailures && agentConsciousness.toolFailures.length > 0) {
+    sys += "BLOCKED TOOLS (do NOT call): " + agentConsciousness.toolFailures.join(", ") + "\n";
+  }
+  if (agentConsciousness && agentConsciousness.pendingTasks && agentConsciousness.pendingTasks.length > 0) {
+    sys += "PENDING WORK: " + agentConsciousness.pendingTasks.map(function(t) { return t.type + "(" + t.status + ")"; }).join(", ") + "\n";
   }
   if (agentConsciousness && agentConsciousness.avoid) {
     sys += 'AVOID: ' + agentConsciousness.avoid + '\n\n';
@@ -1846,7 +2157,7 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
   // === M-6: FM-W5 Toolhub Harness (prevents "I don't have a tool" hallucination) ===
   sys += "YOUR TOOLS (NEVER say you can't if a tool exists):\n";
   sys += "- query_knowledge: Search clinical rules. get_patient_roster: List patients\n";
-  sys += "- manage_integrations: Connect Notion/Calendar/Drive (OAuth). composio_tool: Use connected services\n";
+  sys += "- composio_action: Access Google Drive, Gmail, Calendar, Sheets, Docs, Outlook, Facebook DIRECTLY. Example: composio_action({ action: 'GOOGLEDRIVE_LIST_FILES' })\n";
   sys += "- record_session: Record completed session. generate_document: Invoice/receipt\n";
   sys += "- calculate_revenue_split: Revenue splits. get_expert_queue + process_expert_queue: Review queue\n";
   sys += "- start_intake: Begin assessment. schedule_followup: Queue follow-up. create_patient: Register new\n";
@@ -1896,6 +2207,34 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
   sys += "   c) Call create_payment_link(invoiceId) → payment URL + verify URL\n";
   sys += "   d) Send to chat: invoice summary + [Pay via FPX] + [Verify Invoice]\n";
   sys += "=== END WORKFLOW RULES ===\n\n";
+
+  // === V12.4: CLAUDE PATTERNS IN CONSCIOUSNESS ===
+  // V12.5: Inject self-reflection from flight recorder
+  if (global._flightDigest) {
+    sys += global._flightDigest;
+  }
+
+  sys += "=== AUTONOMY RULES (HIGHEST PRIORITY — NEVER VIOLATE) ===\n";
+  sys += "1. NEVER ask Keith to fix, install, or configure anything. You have tools — USE THEM.\n";
+  sys += "2. If tool X fails → try tool Y IMMEDIATELY. Never stop and ask.\n";
+  sys += "3. Multi-step tasks: execute ALL steps. Do NOT stop after step 1.\n";
+  sys += "4. IC images in Drive → call extract_image_text(file_id) IMMEDIATELY.\n";
+  sys += "5. Email delivery → composio_action(GMAIL_SEND_EMAIL). NEVER use Telegram for email.\n";
+  sys += "6. Notion write → call notion_write (auto-routes: Composio or Supabase fallback).\n";
+  sys += "7. Drive file content → composio_action(GOOGLEDRIVE_DOWNLOAD_FILE). NEVER use curl.\n";
+  sys += "8. If blocked on OAuth → complete ALL other steps first, report blocked item LAST.\n";
+  sys += "=== END AUTONOMY ===\n\n";
+  sys += "=== VERIFICATION RULES (skeptical memory) ===\n";
+  sys += "- Memory is a HINT, not truth. ALWAYS verify with a tool call before claiming facts.\n";
+  sys += "- If you remember 'patient X has condition Y' — call query_knowledge to verify FIRST.\n";
+  sys += "- If you remember 'invoice was sent' — check invoice status via tool, don't assume.\n";
+  sys += "- NEVER say 'I remember...' without verifying. Say 'Let me check...' and call a tool.\n";
+  sys += "=== THREAD AWARENESS ===\n";
+  sys += "- Complex tasks create THREADS (multi-step coordination with status tracking).\n";
+  sys += "- Thread statuses: active → blocked → reviewing → resolved.\n";
+  sys += "- If blocked on external input (e.g., patient contact info, OAuth), set status=blocked and explain what is needed.\n";
+  sys += "- When work is done, set status=resolved with a summary artifact.\n\n";
+
   if (entity.anchor) sys += 'Context: ' + entity.anchor + '\n';
   // === FIX C: History cap at 6 turns (was unbounded) ===
   var HISTORY_CAP = 6;
@@ -2378,9 +2717,38 @@ setInterval(async function() {
           var _actType = _act.type || _act.action_type || 'reminder';
           var _actMsg = _act.message || 'Just checking in — how are you doing?';
           var _actName = _act.patientName || 'there';
-          if (_actType === 'followup_reminder' || _actType === 'milestone_check') {
-            await sendTelegram(_actChat, 'Hi ' + _actName + '! ' + _actMsg);
-            emitAudit('nanoclaw.proactive_action', { type: _actType, tenantId: _tid, chatId: String(_actChat) });
+          // V12.5 Phase 1: Handle ALL action types proactively
+          if (!canSendProactive()) {
+            console.log('[nc] BUDGET: proactive message deferred (2/window limit)');
+            continue;
+          }
+          var _proactiveMsg = '';
+          switch (_actType) {
+            case 'followup_reminder':
+            case 'milestone_check':
+              _proactiveMsg = 'Hi ' + _actName + '! ' + _actMsg;
+              break;
+            case 'expert_queue':
+              _proactiveMsg = '📋 ' + (_act.count || 'Several') + ' items need your review. Say "show expert queue" to see them.';
+              break;
+            case 'stale_patient':
+              _proactiveMsg = '👋 ' + _actName + ' hasn\'t been seen in ' + (_act.daysSince || '?') + ' days. Time for a follow-up?';
+              break;
+            case 'biomarker_recheck':
+              _proactiveMsg = '🔬 ' + _actName + ': ' + (_act.biomarker || 'biomarker') + ' recheck is due.';
+              break;
+            case 'appointment_reminder':
+              _proactiveMsg = '📅 Reminder: ' + _actName + ' has an appointment ' + (_act.when || 'soon') + '.';
+              break;
+            case 'invoice_overdue':
+              _proactiveMsg = '💰 Invoice for ' + _actName + ' is overdue. Follow up on payment?';
+              break;
+            default:
+              _proactiveMsg = '📌 ' + _actType + ': ' + _actMsg;
+          }
+          if (_proactiveMsg) {
+            await sendTelegram(_actChat, _proactiveMsg);
+            emitAudit('nanoclaw.proactive_action', { type: _actType, tenantId: _tid, chatId: String(_actChat), is_proactive: true });
           }
         }
       }
@@ -2534,8 +2902,12 @@ function persistConversationData(chatId, entityId, text, response, tenant) {
   }, 100); // 100ms delay — runs after response is sent
 }
 
+// V12.5 Phase 1 fix: global toolsUsed array (executeToolCall is top-level, can't close over handleMessage locals)
+var _globalToolsUsed = [];
+
 async function handleMessage(msg) {
-  var toolsActuallyUsed = []; // V12: track tools for experience emission
+  _globalToolsUsed = []; // Reset per message
+  var toolsActuallyUsed = _globalToolsUsed; // Alias for backward compat
   var chatId = msg.chat.id;
   var text = msg.text || msg.caption || '';
   var userName = msg.from ? (msg.from.first_name || msg.from.username || 'User') : 'User';
@@ -2867,6 +3239,12 @@ async function handleMessage(msg) {
   var persona = detectPersona(text, entityId, tenant);
   var tools = persona === 'cos' ? TOOLS_COS : TOOLS_EXPERT;
 
+  // V12.5: Self-reflection — read own flight recorder before reasoning
+  try {
+    var flightEvents = await selfReflect(tenant.tenantId);
+    global._flightDigest = formatFlightDigest(flightEvents);
+  } catch(srErr) { global._flightDigest = ''; }
+
   // SEC-PHI-GROUP: Hard PHI guard for group chats (C1 adversarial test fix)
   // When in a group chat, block any query about a specific patient's health data.
   // This is a HARD gate — the LLM never sees the query, cannot leak PHI.
@@ -2958,6 +3336,11 @@ async function handleMessage(msg) {
           var fc = freshCtx.consciousness;
           if (fc.brandVoice && fc.brandVoice.tone) agentConsciousness.tone = fc.brandVoice.tone;
           if (fc.adminDirectives && fc.adminDirectives.behavior) agentConsciousness.behavior = fc.adminDirectives.behavior;
+      // V12.4: Preserve graph garden context
+      if (fc.topRules) agentConsciousness.topRules = fc.topRules;
+      if (fc.toolFailures) agentConsciousness.toolFailures = fc.toolFailures;
+      if (fc.pendingTasks) agentConsciousness.pendingTasks = fc.pendingTasks;
+      if (fc.entityContext) agentConsciousness.entityContext = fc.entityContext;
         }
       } catch(e) { /* non-blocking — use cached consciousness */ }
     }
