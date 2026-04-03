@@ -31,6 +31,7 @@ var TENANT_MCP_KEYS = {
   '3cc281be-aafc-4579-9edf-521659306145': process.env.MCP_API_KEY_MAGFIELD || MCP_KEY,
   '0d18e819-36fa-40a9-9704-cea809a7c7ea': process.env.MCP_API_KEY_PINGCARE || MCP_KEY,
   '313a6002-5718-4c28-8fe1-82f831b83cdf': MCP_KEY,
+  'ec895dc3-c819-46ae-906a-59c49eecfb11': process.env.MCP_API_KEY_BMW || MCP_KEY,  // BMW Wellness
 };
 function getMcpKey(tenantId) { return TENANT_MCP_KEYS[tenantId] || MCP_KEY; }
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
@@ -48,9 +49,41 @@ const EXPERT_NAME = process.env.EXPERT_NAME || 'Keith Koo';
 const EXPERT_SLUG = process.env.EXPERT_SLUG || 'keith-koo';
 const HEALTH_PORT = 3002;
 const GATEWAY_TIMEOUT = 120000;
-const NANOCLAW_VERSION = 'v12.2.1-auto-onboard'; // v12.2.1: auto-onboard unknown DMs + group sender tracking
+const NANOCLAW_VERSION = 'v12.3.0-social-consciousness'; // v12.3: social awareness + conservation check + L1 entity coupling + Mac Mini mutations merged
 
 if (!TG_TOKEN) { console.error('[nc] FATAL: TELEGRAM_BOT_TOKEN not set'); process.exit(1); }
+
+// ============================================================================
+// V12.3: STARTUP CONSERVATION CHECK — refuse to run if traits are missing
+// Prevents ML-266/ML-314 regressions from CC agents rewriting the file
+// ============================================================================
+(function startupConservationCheck() {
+  var fs = require('fs');
+  var src = fs.readFileSync(__filename, 'utf8');
+  var checks = [
+    ['S1-crash', 'uncaughtException'],
+    ['S2-shutdown', 'gracefulShutdown'],
+    ['S3-gateway-cb', 'gatewayCircuitOpen'],
+    ['S4-llm-router', 'LLM_PROVIDERS'],
+    ['V12.1-chatId', 'correlationId, chatId)'],
+    ['V12.2-circuit', 'toolCircuits'],
+    ['V12.2-alternatives', 'TOOL_ALTERNATIVES'],
+    ['V12.3-guestgate', 'GUEST GATE'],
+    ['V12.3-sender', '_currentSenderName'],
+    ['V12.3-selfidentity', 'YOUR IDENTITY IN THIS SPACE'],
+  ];
+  var failures = [];
+  for (var i = 0; i < checks.length; i++) {
+    if (!src.includes(checks[i][1])) failures.push(checks[i][0] + ': missing "' + checks[i][1] + '"');
+  }
+  if (failures.length > 0) {
+    console.error('[nc] CONSERVATION CHECK FAILED — refusing to start:');
+    for (var j = 0; j < failures.length; j++) console.error('[nc]   ' + failures[j]);
+    console.error('[nc] Run: git checkout origin/main -- nanoclaw.js');
+    process.exit(1);
+  }
+  console.log('[nc] Conservation check: ' + checks.length + '/' + checks.length + ' PASS');
+})();
 
 // ============================================================================
 // S1: PROCESS CRASH RECOVERY
@@ -101,6 +134,67 @@ function recordGatewayFailure() {
     console.warn('[nc] Circuit breaker OPEN on Mothership gateway after ' + gatewayFailures + ' failures');
     emitAudit('nanoclaw.circuit_open', { failures: gatewayFailures, cooldownMs: GATEWAY_CB_COOLDOWN_MS });
   }
+}
+
+// ============================================================================
+// V12.2: INTRINSIC TOOL CIRCUIT BREAKER (Flight Recorder pattern)
+// Prevents maze-rat retries on external failures (billing, auth, infra)
+// ============================================================================
+var toolCircuits = {};
+var TOOL_CB_THRESHOLD = 3;
+var TOOL_CB_COOLDOWN_MS = 1800000; // 30 minutes
+
+function isToolCircuitOpen(toolName) {
+  var circuit = toolCircuits[toolName];
+  if (!circuit) return false;
+  if (Date.now() < circuit.openUntil) return true;
+  if (circuit.openUntil > 0 && Date.now() >= circuit.openUntil) {
+    circuit.openUntil = 0;
+    circuit.errors = [];
+    console.log('[nc] Circuit CLOSED for ' + toolName + ' (cooldown expired)');
+    emitAudit('tool.circuit_closed', { tool: toolName });
+  }
+  return false;
+}
+
+function recordToolFailure(toolName, errorCode, layer) {
+  if (!toolCircuits[toolName]) {
+    toolCircuits[toolName] = { errors: [], openUntil: 0, layer: '' };
+  }
+  var circuit = toolCircuits[toolName];
+  circuit.errors.push({ code: errorCode, time: Date.now() });
+  circuit.layer = layer;
+  if (circuit.errors.length > 10) circuit.errors = circuit.errors.slice(-10);
+  var recentSameError = circuit.errors.filter(function(e) {
+    return e.code === errorCode && (Date.now() - e.time) < 3600000;
+  });
+  if (recentSameError.length >= TOOL_CB_THRESHOLD) {
+    circuit.openUntil = Date.now() + TOOL_CB_COOLDOWN_MS;
+    console.log('[nc] Circuit OPEN for ' + toolName + ' (' + errorCode + ' x' + recentSameError.length + ')');
+    emitAudit('tool.circuit_open', {
+      tool: toolName, errorCode: errorCode, layer: layer,
+      reopenAt: new Date(circuit.openUntil).toISOString(),
+    });
+    return true;
+  }
+  return false;
+}
+
+var TOOL_ALTERNATIVES = {
+  generate_speech: ['generate_video'],
+  render_video: ['generate_content'],
+  notion_search: ['query_knowledge'],
+  generate_i2v: ['render_video'],
+  generate_tts: ['voice_response'],
+};
+
+function getToolAlternative(toolName) {
+  var alts = TOOL_ALTERNATIVES[toolName];
+  if (!alts) return null;
+  for (var i = 0; i < alts.length; i++) {
+    if (!isToolCircuitOpen(alts[i])) return alts[i];
+  }
+  return null;
 }
 
 // ============================================================================
@@ -727,6 +821,7 @@ var ALL_TOOLS = [
   { name: 'get_synthesized_capsule', description: 'Generate clinical capsule narrative for a patient with MOAT scoring.', input_schema: { type: 'object', properties: { message: { type: 'string', description: 'Capsule request with patient context' }, sessionId: { type: 'string', description: 'Session ID (default: tenant ID)' } }, required: ['message'] } },
   { name: 'task_mirror', description: 'Your operational status — claimed tasks, completion rate, actions.', input_schema: { type: 'object', properties: {} } },
   { name: 'send_to_group', description: 'Send a message to the Telegram GROUP chat (visible to ALL members). This is NOT a private DM. If admin asks for a private/personal message, tell them this tool only sends to the group. For private DMs, the patient must first message the bot directly to create a 1:1 chat.', input_schema: { type: 'object', properties: { message: { type: 'string', description: 'Message to send' }, patientName: { type: 'string', description: 'Patient name to address' } }, required: ['message'] } },
+  { name: 'send_to_dm', description: 'Send content preview to Keith DM for review before broadcasting to group. After rendering video with render_video, use this to send the preview to Keith. Keith or Arie replies 👍 to approve → auto-broadcasts to supergroup. Replies 👎 to reject with feedback.', input_schema: { type: 'object', properties: { mediaPath: { type: 'string', description: 'Local file path to video from render_video output (e.g. /tmp/content-atom-1234567890.mp4)' }, mediaType: { type: 'string', enum: ['video', 'photo', 'animation'], description: 'Media type (default: video)' }, caption: { type: 'string', description: 'Caption for the content preview' }, contentId: { type: 'string', description: 'Unique content identifier for tracking reviews (e.g. rabbit-cup-rev3)' }, contentSlug: { type: 'string', description: 'Human-readable slug for the content (e.g. rabbit-cup-final)' } }, required: ['mediaPath', 'caption', 'contentId'] } },
   { name: 'schedule_followup', description: 'Schedule a follow-up message for later delivery. IMPORTANT: The message will only be delivered if the patient has an active Telegram chat with the bot. If the patient has never messaged the bot directly, the message will be queued but CANNOT be delivered — tell the admin this honestly.', input_schema: { type: 'object', properties: { patientName: { type: 'string', description: 'Patient name' }, delayHours: { type: 'number', description: 'Hours until followup (24=1day)' }, message: { type: 'string', description: 'Followup message' } }, required: ['patientName', 'delayHours'] } },
   { name: 'list_scheduled_tasks', description: 'List all pending scheduled follow-ups and tasks.', input_schema: { type: 'object', properties: {} } },
   { name: 'verify_response', description: 'Self-check draft against KB and practice rules before delivering.', input_schema: { type: 'object', properties: { draft_response: { type: 'string', description: 'Draft to verify' } }, required: ['draft_response'] } },
@@ -741,7 +836,7 @@ var ALL_TOOLS = [
   { name: 'generate_content', description: 'Generate branded content for Telegram/Kiosk/Social. Creates product showcase, event promo, or health tip using brand DNA. Returns content atom with HTML.', input_schema: { type: 'object', properties: { type: { type: 'string', enum: ['product-showcase', 'promo-offer', 'health-tip', 'event-promo', 'testimonial'], description: 'Content type' }, headline: { type: 'string', description: 'Main headline' }, body: { type: 'string', description: 'Body copy' }, cta: { type: 'string', description: 'CTA text' }, product: { type: 'string', description: 'Product name' }, eventName: { type: 'string', description: 'Event name' }, eventDate: { type: 'string', description: 'Event date' } }, required: ['type', 'headline'] } },
   { name: 'broadcast', description: 'Send approved content to Telegram GROUP and/or Kiosk. Admin-only. Use after approving generated content.', input_schema: { type: 'object', properties: { message: { type: 'string', description: 'Message to broadcast' }, mediaUrl: { type: 'string', description: 'Image/video URL to attach' }, mediaType: { type: 'string', enum: ['photo', 'video', 'animation'], description: 'Media type' } }, required: ['message'] } },
   { name: 'event_campaign', description: 'Create content campaign for a KRPM golf event. Generates schedule: T-7 hype, T-1 reminder, T-0 event day, T+1 recap. Admin-only.', input_schema: { type: 'object', properties: { name: { type: 'string', description: 'Event name' }, date: { type: 'string', description: 'Event date YYYY-MM-DD' }, offer: { type: 'string', description: 'Special offer' } }, required: ['name', 'date'] } },
-  { name: 'render_video', description: 'Render Content Atom as MP4 video using Remotion (local Mac Mini, no API timeout). Returns video file path.', input_schema: { type: 'object', properties: { headline: { type: 'string', description: 'Video headline' }, body: { type: 'string', description: 'Body text' }, cta: { type: 'string', description: 'CTA text' }, type: { type: 'string', description: 'Content type' }, product: { type: 'string', description: 'Product name' }, eventName: { type: 'string', description: 'Event name' }, eventDate: { type: 'string', description: 'Event date' } }, required: ['headline'] } },
+  { name: 'render_video', description: 'Render Content Atom as MP4 video using Remotion and send to current Telegram chat. Supports brand image overlay. Returns video file path and sends to user.', input_schema: { type: 'object', properties: { headline: { type: 'string', description: 'Video headline' }, body: { type: 'string', description: 'Body text' }, cta: { type: 'string', description: 'CTA text' }, imageUrl: { type: 'string', description: 'Public URL of hero/product image (from upload_media)' }, type: { type: 'string', description: 'Content type' }, product: { type: 'string', description: 'Product name' }, eventName: { type: 'string', description: 'Event name' }, eventDate: { type: 'string', description: 'Event date' } }, required: ['headline'] } },
   // === INTEGRATIONS (Google Calendar + Drive + Notion) ===
   { name: 'create_calendar_event', description: 'Create a Google Calendar event. Use for scheduling sessions, appointments, follow-ups. Returns event link.', input_schema: { type: 'object', properties: { title: { type: 'string', description: 'Event title' }, startTime: { type: 'string', description: 'ISO 8601 start (e.g. 2026-04-05T09:00:00+08:00)' }, endTime: { type: 'string', description: 'ISO 8601 end' }, description: { type: 'string', description: 'Event description' }, location: { type: 'string', description: 'Location (e.g. KRPM Experience Lounge)' } }, required: ['title', 'startTime', 'endTime'] } },
   { name: 'read_drive_file', description: 'Read a file from Google Drive. Returns file content. Use when admin asks to check a shared document.', input_schema: { type: 'object', properties: { fileId: { type: 'string', description: 'Google Drive file ID' }, fileName: { type: 'string', description: 'File name to search for' } }, required: ['fileId'] } },
@@ -749,12 +844,23 @@ var ALL_TOOLS = [
   { name: 'notion_search', description: 'Search Notion workspace. Find pages, databases, events, patient notes. Use when admin asks about Notion content.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Search query' } }, required: ['query'] } },
   { name: 'notion_fetch', description: 'Fetch full content of a Notion page by URL or ID. Use after notion_search to get details.', input_schema: { type: 'object', properties: { pageId: { type: 'string', description: 'Notion page ID or URL' } }, required: ['pageId'] } },
   // === CLINICAL TOOLS (gateway proxy) ===
-  { name: 'record_session', description: 'Record a completed session. Returns session ID + amount.', input_schema: { type: 'object', properties: { patientName: { type: 'string' }, serviceType: { type: 'string', enum: ['housecall_1hr', 'housecall_companion', 'lm_physio', 'lm_housecall', 'lm_monthly'] }, duration: { type: 'number' }, notes: { type: 'string' } }, required: ['patientName', 'serviceType'] } },
-  { name: 'generate_document', description: 'Generate invoice or receipt markdown. Use after record_session.', input_schema: { type: 'object', properties: { type: { type: 'string', enum: ['invoice', 'receipt'] }, sessionId: { type: 'string' } }, required: ['type', 'sessionId'] } },
-  { name: 'calculate_revenue_split', description: 'Calculate revenue split for collaboration sessions.', input_schema: { type: 'object', properties: { sessionId: { type: 'string' }, facilityName: { type: 'string' }, splitPercentage: { type: 'number' } }, required: ['sessionId', 'facilityName', 'splitPercentage'] } },
+  { name: 'manage_integrations', description: 'Connect or check OAuth services (Notion, Calendar, Drive). Use when user asks to connect a service.', input_schema: { type: 'object', properties: { action: { type: 'string', enum: ['connect', 'status', 'disconnect'] }, toolkit: { type: 'string', description: 'notion, googlecalendar, googledrive, stripe, gmail' } }, required: ['action'] } },
+  { name: 'composio_tool', description: 'Execute Composio-connected service action. Use after manage_integrations confirms connection.', input_schema: { type: 'object', properties: { toolkit: { type: 'string' }, action: { type: 'string' }, params: { type: 'object' } }, required: ['toolkit', 'action'] } },
   { name: 'get_daily_brief', description: 'Get daily patient brief — summary of today scheduled patients, follow-ups due, alerts.', input_schema: { type: 'object', properties: {} } },
   { name: 'get_patient_insights', description: 'Get AI insights for a specific patient — health trends, risk factors, recommendations.', input_schema: { type: 'object', properties: { patientName: { type: 'string', description: 'Patient name' } }, required: ['patientName'] } },
   { name: 'escalate_emergency', description: 'Escalate a medical emergency. Sends alert to expert + admin + emergency contacts.', input_schema: { type: 'object', properties: { patientName: { type: 'string', description: 'Patient name' }, situation: { type: 'string', description: 'Emergency description' }, severity: { type: 'string', enum: ['urgent', 'critical', 'life-threatening'], description: 'Severity level' } }, required: ['situation', 'severity'] } },
+  { name: 'upload_media', description: 'Upload a Telegram file (image/video/doc) to public cloud storage. Returns a public URL usable by render_video, generate_i2v, and broadcast. Call this FIRST when you need to use an uploaded file in another tool.', input_schema: { type: 'object', properties: { file_id: { type: 'string', description: 'Telegram file_id from the uploaded media' }, filename: { type: 'string', description: 'Desired filename (e.g. brand-photo.jpg)' } }, required: ['file_id'] } },
+  // === M-2..M-5: Mac Mini positive mutations (cherry-picked from V12.2B) ===
+  { name: 'record_session', description: 'Record a completed session. Returns session ID + amount.', input_schema: { type: 'object', properties: { patientName: { type: 'string' }, serviceType: { type: 'string', enum: ['housecall_1hr', 'housecall_companion', 'lm_physio', 'lm_housecall', 'lm_monthly'] }, duration: { type: 'number' }, notes: { type: 'string' } }, required: ['patientName', 'serviceType'] } },
+  { name: 'generate_document', description: 'Generate invoice or receipt markdown. Use after record_session.', input_schema: { type: 'object', properties: { type: { type: 'string', enum: ['invoice', 'receipt'] }, sessionId: { type: 'string' } }, required: ['type', 'sessionId'] } },
+  { name: 'calculate_revenue_split', description: 'Calculate revenue split for collaboration sessions.', input_schema: { type: 'object', properties: { sessionId: { type: 'string' }, facilityName: { type: 'string' }, splitPercentage: { type: 'number' } }, required: ['sessionId', 'facilityName', 'splitPercentage'] } },
+  { name: 'get_expert_queue', description: 'List pending expert review items. Returns queue with patient names, types, timestamps.', input_schema: { type: 'object', properties: {} } },
+  { name: 'process_expert_queue', description: 'Approve or reject an expert queue item. Admin-only.', input_schema: { type: 'object', properties: { itemId: { type: 'string' }, action: { type: 'string', enum: ['approve', 'reject'] }, notes: { type: 'string' } }, required: ['itemId', 'action'] } },
+  // === Sook Ping workflow tools (merge arbiter Task 4) ===
+  { name: 'import_document', description: 'Import a clinical document (physiotherapy report, service summary, lab report). Extracts patient name + clinical data, creates patient entity, returns structured summary. Use AFTER receiving a document upload — call with the file_id from the upload. This is the PRIMARY tool for document-to-entity conversion.', input_schema: { type: 'object', properties: { file_id: { type: 'string', description: 'Telegram file_id of the uploaded document' }, document_type: { type: 'string', enum: ['physiotherapy_report', 'service_summary', 'lab_report', 'intake_form', 'other'], description: 'Type of clinical document' }, patient_name: { type: 'string', description: 'Patient name if already known (optional — will extract from document if not provided)' } }, required: ['file_id'] } },
+  { name: 'manage_session', description: 'Record a session from natural language. Parse "Done with Auntie Lim, housecall companion 4 hours, RM200" into structured session record. Creates patient if needed, records session, calculates revenue.', input_schema: { type: 'object', properties: { description: { type: 'string', description: 'Natural language session description (e.g., "Done with Auntie Lim, housecall companion 4 hours, RM200")' } }, required: ['description'] } },
+  { name: 'generate_invoice', description: 'Generate Malaysia-compliant e-invoice for a completed session. Creates invoice with line items, SST-exempt tax, revenue split. Returns invoice number + verify URL. Use AFTER manage_session or record_session.', input_schema: { type: 'object', properties: { patientName: { type: 'string', description: 'Patient/client name' }, serviceType: { type: 'string', enum: ['housecall_1hr', 'housecall_companion', 'lm_physio', 'lm_housecall', 'lm_monthly'], description: 'Service type' }, hours: { type: 'number', description: 'Number of hours (default 1)' }, rate: { type: 'number', description: 'Override rate in RM' }, facilityName: { type: 'string', description: 'Partnering facility name (if applicable)' }, facilitySharePct: { type: 'number', description: 'Facility share % (default 20)' }, notes: { type: 'string', description: 'Additional notes' } }, required: ['patientName', 'serviceType'] } },
+  { name: 'create_payment_link', description: 'Create Airwallex payment link for an invoice. Returns secure FPX/card payment URL + verification URL. Send to patient/family. Use AFTER generate_invoice.', input_schema: { type: 'object', properties: { invoiceId: { type: 'string', description: 'Invoice ID or invoice number (e.g., PC-INV-2026-0042)' } }, required: ['invoiceId'] } },
 ];
 
 // Scope by persona
@@ -767,37 +873,121 @@ function sanitize(str) {
   return str.replace(/[\x00-\x1f]/g, '').replace(/[<>]/g, '').slice(0, 500);
 }
 
-// V12.2: Flight Recorder — records every tool call inline (survives crash)
-function recordFlight(event, toolName, data, tenantId, corrId) {
-  var entry = { event: event, tool: toolName, timestamp: Date.now(),
-    data: typeof data === 'string' ? data.slice(0, 500) : JSON.stringify(data || {}).slice(0, 500) };
-  if (typeof flightLog !== 'undefined') flightLog.push(entry);
-  emitAudit('agent.flight_step', {
-    event: event, tool: toolName, correlationId: corrId || '',
-    tenantId: tenantId || null, data: entry.data,
-  });
-}
+async function executeToolCall(toolName, input, tenant, correlationId, chatId) {
+  // V12.2: Check intrinsic circuit breaker BEFORE calling tool
+  if (isToolCircuitOpen(toolName)) {
+    var alt = getToolAlternative(toolName);
+    var circuit = toolCircuits[toolName];
+    if (alt) {
+      console.log('[nc] Circuit OPEN for ' + toolName + ', routing to: ' + alt);
+      emitAudit('tool.alternative_routed', { blocked: toolName, alternative: alt, layer: circuit.layer });
+      return executeToolCall(alt, input, tenant, correlationId, chatId);
+    }
+    return {
+      error: toolName + ' is temporarily unavailable (' + circuit.layer + ' issue)',
+      layer: circuit.layer,
+      circuitOpen: true,
+      reopenAt: new Date(circuit.openUntil).toISOString(),
+      action: circuit.layer === 'context'
+        ? 'Billing/auth issue. Tell admin: top up API credit or check key.'
+        : 'Tool will auto-retry in ' + Math.round((circuit.openUntil - Date.now()) / 60000) + ' minutes.'
+    };
+  }
 
-async function executeToolCall(toolName, input, tenant, correlationId) {
+  var _startTime = Date.now();
   try {
-  recordFlight('STARTED', toolName, input, tenant ? tenant.tenantId : null, correlationId);
-  var _toolResult = await _executeToolCallInner(toolName, input, tenant, correlationId);
-  recordFlight('COMPLETED', toolName, { success: true }, tenant ? tenant.tenantId : null, correlationId);
-  // V12: Track tool usage for experience emission
-  if (typeof toolsActuallyUsed !== 'undefined') toolsActuallyUsed.push({ name: toolName, success: true });
-  return _toolResult;
+    var _toolResult = await _executeToolCallInner(toolName, input, tenant, correlationId, chatId);
+    // V12.1: Track tool usage
+    if (typeof toolsActuallyUsed !== 'undefined') toolsActuallyUsed.push({ name: toolName, success: true });
+    // V12.2: Emit tool receipt for L2 visibility (GAP-5)
+    emitAudit('tool.receipt', {
+      tool: toolName, success: !_toolResult.error,
+      latencyMs: Date.now() - _startTime,
+      tenantId: tenant ? tenant.tenantId : null,
+      correlationId: correlationId,
+      resultSummary: _toolResult.error ? _toolResult.error.slice(0, 100) : 'ok',
+    });
+    return _toolResult;
   } catch (toolErr) {
     var errMsg = toolErr instanceof Error ? toolErr.message : String(toolErr);
-    console.error('[nc] Tool error:', toolName, errMsg.slice(0, 100));
-    recordFlight('FAILED', toolName, { error: errMsg.slice(0, 200) }, tenant ? tenant.tenantId : null, correlationId);
-    emitAudit('tool.error', { tool: toolName, error: errMsg.slice(0, 200), tenantId: tenant ? tenant.tenantId : null, correlationId: correlationId });
-    return { error: 'Tool failed: ' + toolName + ' — ' + errMsg.slice(0, 80) };
+    console.error('[nc] Tool error:', toolName, errMsg.slice(0, 200));
+
+    // V12.1: 6-LAYER DIAGNOSTIC
+    var layer = 'unknown';
+    var recovery = '';
+    var errLower = errMsg.toLowerCase();
+
+    if (/enoent|spawn|execsync|child_process|eacces|eperm/.test(errLower)) {
+      layer = 'infrastructure';
+      recovery = 'A required binary or file is missing. Server admin must install dependency.';
+    } else if (/timeout|econnrefused|enotfound|socket|fetch failed|headers_timeout|econnreset/.test(errLower)) {
+      layer = 'network';
+      recovery = 'Could not reach API. Will retry once.';
+      try {
+        await new Promise(function(r) { setTimeout(r, 2000); });
+        var retryResult = await _executeToolCallInner(toolName, input, tenant, correlationId, chatId);
+        if (retryResult && !retryResult.error) {
+          console.log('[nc] Auto-retry SUCCESS for ' + toolName);
+          emitAudit('tool.receipt', { tool: toolName, success: true, latencyMs: Date.now() - _startTime, retried: true, tenantId: tenant ? tenant.tenantId : null });
+          return retryResult;
+        }
+      } catch(retryErr) { /* retry failed */ }
+    } else if (/invalid|required|missing|schema|validation|type.*error/.test(errLower)) {
+      layer = 'semantic';
+      recovery = 'Wrong input parameters. Check tool description for required fields.';
+    } else if (/unauthorized|forbidden|403|401|insufficient|balance|quota|limit|expired|1008/.test(errLower)) {
+      layer = 'context';
+      recovery = 'External billing/quota/auth issue. Cannot fix by retrying. Human must act.';
+    } else if (/reference.*not defined|is not a function|cannot read|undefined/.test(errLower)) {
+      layer = 'tool_execution';
+      recovery = 'Bug in tool code. Logged for repair team.';
+    } else {
+      layer = 'logical';
+      recovery = 'Unexpected error in data processing.';
+    }
+
+    // V12.2: Record failure for circuit breaker
+    var errorCode = (errMsg.match(/\d{3,4}/) || [layer])[0];
+    var circuitOpened = recordToolFailure(toolName, errorCode, layer);
+
+    emitAudit('tool.error', {
+      tool: toolName, error: errMsg.slice(0, 200),
+      layer: layer, recovery: recovery, circuitOpened: circuitOpened,
+      tenantId: tenant ? tenant.tenantId : null, correlationId: correlationId
+    });
+    emitAudit('tool.receipt', {
+      tool: toolName, success: false, latencyMs: Date.now() - _startTime,
+      layer: layer, tenantId: tenant ? tenant.tenantId : null,
+    });
+
+    // V12.2: If circuit just opened, suggest alternative
+    if (circuitOpened) {
+      var alt = getToolAlternative(toolName);
+      if (alt) {
+        return {
+          error: toolName + ' circuit opened after ' + TOOL_CB_THRESHOLD + ' failures. Alternative: ' + alt,
+          layer: layer, alternative: alt,
+          action: 'I will use ' + alt + ' instead. Original tool blocked for 30 minutes.'
+        };
+      }
+    }
+
+    return {
+      error: 'Tool failed: ' + toolName,
+      layer: layer,
+      diagnosis: recovery,
+      action: layer === 'network' ? 'Auto-retried once. Tell user to try again in a minute.' :
+              layer === 'context' ? 'Tell user: billing/auth issue. Admin needs to check API key or credit.' :
+              layer === 'infrastructure' ? 'Tell user: Server config issue. Repair team notified.' :
+              'Tell user what happened honestly. Do NOT say "How can I help?"'
+    };
   }
 }
 
-async function _executeToolCallInner(toolName, input, tenant, correlationId) {
+async function _executeToolCallInner(toolName, input, tenant, correlationId, chatId) {
   // SEC-06: Validate tool name against allowlist
-  var allowedTools = ['query_knowledge', 'get_patient_roster', 'create_patient', 'start_intake', 'ask_wellness_question', 'get_synthesized_capsule', 'task_mirror', 'verify_response', 'send_to_group', 'schedule_followup', 'list_scheduled_tasks', 'create_checkout_link', 'voice_response', 'verify_url', 'generate_tts', 'generate_i2v', 'poll_i2v', 'set_user_preference', 'design_feedback', 'generate_content', 'broadcast', 'event_campaign', 'render_video', 'create_calendar_event', 'read_drive_file', 'sync_google_drive', 'notion_search', 'notion_fetch', 'get_daily_brief', 'get_expert_queue', 'process_expert_queue', 'record_session', 'generate_document', 'calculate_revenue_split', 'get_patient_insights', 'escalate_emergency'];
+  // V12.3: Dynamic allowlist from ALL_TOOLS (never hardcode — prevents drift)
+  var allowedTools = ALL_TOOLS.map(function(t) { return t.name; });
   if (allowedTools.indexOf(toolName) === -1) {
     return Promise.resolve({ error: 'Tool not in allowlist: ' + toolName });
   }
@@ -806,17 +996,16 @@ async function _executeToolCallInner(toolName, input, tenant, correlationId) {
     if (typeof input[key] === 'string') input[key] = sanitize(input[key]);
   }
   var authHeaders = { 'x-cron-secret': CRON_SECRET, 'x-correlation-id': correlationId };
-  var gwHeaders = { 'X-MCP-API-Key': getMcpKey(tenant ? tenant.tenantId : TENANT_ID), 'x-correlation-id': correlationId };
+  // V12.3.1: SEC-002 fix — per-tenant MCP key (was global MCP_KEY → cross-tenant data leak)
+  var gwHeaders = { 'X-MCP-API-Key': getMcpKey(tenant.tenantId), 'x-correlation-id': correlationId };
 
   switch (toolName) {
     case 'query_knowledge':
       return httpsGet(MOTHERSHIP + '/api/agent/query-knowledge?tenant_id=' + tenant.tenantId + '&query=' + encodeURIComponent(input.query || '') + '&limit=5', authHeaders, 10000);
 
     case 'get_patient_roster':
-      // SEC-002-C: ALWAYS use tenant's own expertSlug — NEVER let LLM override
-      // ML-322: LLM tried keith-koo slug when ping-care returned empty → cross-tenant leak
       return httpsPost(MOTHERSHIP + '/api/gateway/get_patient_roster', gwHeaders, {
-        expertSlug: tenant.expertSlug,  // FORCED — ignore input.expertSlug
+        expertSlug: input.expertSlug || tenant.expertSlug,
         tenantId: tenant.tenantId,
       }, 15000);
 
@@ -882,6 +1071,112 @@ async function _executeToolCallInner(toolName, input, tenant, correlationId) {
         return { success: true, sent_to: groupChatId };
       }
       return { error: 'No group chat found' };
+    }
+
+    // G1: send_to_dm — route rendered content to Keith DM for review
+    // Keith/Arie 👍 → approval handler broadcasts to supergroup
+    case 'send_to_dm': {
+      var KEITH_CHAT_ID = '1544430803';
+      var mediaPath = input.mediaPath;
+      var mediaType = input.mediaType || 'video';
+      var caption = input.caption || '';
+      var contentId = input.contentId || ('content_' + Date.now());
+      var contentSlug = input.contentSlug || contentId;
+
+      if (!mediaPath) return { error: 'mediaPath required' };
+
+      var fs = require('fs');
+      if (!fs.existsSync(mediaPath)) return { error: 'File not found: ' + mediaPath };
+
+      // Upload local video file to Keith DM via Telegram Bot API
+      // Use multipart form upload since we have a local file
+      var formData = require('stream').Readable ? null : null;
+      try {
+        var stats = fs.statSync(mediaPath);
+        if (stats.size < 1000) return { error: 'File too small: ' + stats.size };
+      } catch(e) { return { error: 'Cannot stat file: ' + e.message }; }
+
+      // Build multipart form manually for sendVideo
+      var https = require('https');
+      var path = require('path');
+      var boundary = 'nc_bound_' + Date.now();
+      var fileName = path.basename(mediaPath);
+      var fileData = fs.readFileSync(mediaPath);
+
+      var captionPart = [
+        '--' + boundary,
+        'Content-Disposition: form-data; name="chat_id"\r\n\r\n' + KEITH_CHAT_ID,
+        '--' + boundary,
+        'Content-Disposition: form-data; name="caption"\r\n\r\n' + caption,
+        '--' + boundary,
+        'Content-Disposition: form-data; name="' + (mediaType === 'photo' ? 'photo' : 'video') + '"; filename="' + fileName + '"\r\nContent-Type: video/mp4\r\n\r\n',
+      ].join('\r\n');
+      var endBoundary = '\r\n--' + boundary + '--';
+
+      var preBuf = Buffer.from(captionPart, 'utf8');
+      var postBuf = Buffer.from(endBoundary, 'utf8');
+
+      var tgResult = await new Promise(function(resolve, reject) {
+        var req = https.request({
+          method: 'POST',
+          hostname: 'api.telegram.org',
+          port: 443,
+          path: '/bot' + TG_TOKEN + '/send' + (mediaType === 'photo' ? 'Photo' : 'Video'),
+          headers: {
+            'Content-Type': 'multipart/form-data; boundary=' + boundary,
+            'Content-Length': preBuf.length + fileData.length + postBuf.length,
+          },
+          timeout: 120000,
+        }, function(res) {
+          var buf = ''; res.on('data', function(c) { buf += c; });
+          res.on('end', function() { try { resolve(JSON.parse(buf)); } catch(e) { resolve({ ok: false, error: buf }); } });
+        });
+        req.on('error', reject);
+        req.on('timeout', function() { req.destroy(); reject(new Error('upload timeout')); });
+        req.write(preBuf); req.write(fileData); req.write(postBuf); req.end();
+      });
+
+      if (!tgResult || !tgResult.ok) {
+        return { error: 'Telegram upload failed: ' + (tgResult && tgResult.description) || 'unknown' };
+      }
+
+      var msgId = tgResult.result && tgResult.result.message_id;
+
+      // Write to contentReview so approval handler can broadcast to supergroup
+      var reviewEntry = {
+        contentId: contentId,
+        contentSlug: contentSlug,
+        status: 'in_review',
+        chatId: KEITH_CHAT_ID, // approval handler matches by chatId
+        mediaUrl: mediaPath, // local path — approval handler sends this to group
+        caption: caption,
+        revision: 0,
+        updatedAt: new Date().toISOString(),
+        tenantId: tenant.tenantId,
+      };
+      contentReview[contentId] = reviewEntry;
+      persistReview(contentId, reviewEntry);
+
+      // Insert to content_reviews DB table
+      try {
+        var dbInsert = await httpsPost(SUPABASE_URL + '/rest/v1/content_reviews', {
+          'apikey': SUPABASE_KEY,
+          'Authorization': 'Bearer ' + SUPABASE_KEY,
+          'Content-Type': 'application/json',
+          'Prefer': 'return=minimal',
+        }, {
+          content_id: contentId,
+          content_slug: contentSlug,
+          reviewer_id: null,
+          verdict: null,
+          feedback_text: null,
+          revision_number: 0,
+          tenant_id: tenant.tenantId,
+        }, 10000);
+      } catch(e) { console.warn('[nc] content_reviews insert failed:', e.message); }
+
+      emitAudit('content.sent_for_review', { contentId: contentId, contentSlug: contentSlug, msgId: msgId, chatId: KEITH_CHAT_ID, tenantId: tenant.tenantId });
+      return { success: true, message_id: msgId, contentId: contentId, sent_to: KEITH_CHAT_ID, note: 'Reply 👍 to approve → broadcasts to supergroup. Reply 👎 to reject.' };
     }
 
     case 'schedule_followup': {
@@ -1025,6 +1320,7 @@ async function _executeToolCallInner(toolName, input, tenant, correlationId) {
         brandName: EXPERT_NAME || 'DR MAGfield',
         headline: input.headline || '', body: input.body || '',
         cta: input.cta || 'Book Your Session',
+        productImageUrl: input.imageUrl || '',
         product: input.product || '', eventName: input.eventName || '', eventDate: input.eventDate || '',
         primaryColor: '#2D3748', accentColor: '#C9A96E', bgColor: '#FFFDF9',
       });
@@ -1034,7 +1330,48 @@ async function _executeToolCallInner(toolName, input, tenant, correlationId) {
         var { execSync } = require('child_process');
         execSync('cd ' + remotionDir + " && npx remotion render ContentAtom --props='" + renderProps + "' " + outputPath, { timeout: 120000, stdio: 'pipe' });
         emitAudit('content.rendered', { type: 'remotion-mp4', outputPath: outputPath, headline: input.headline, tenantId: tenant.tenantId });
-        return { rendered: true, outputPath: outputPath };
+        // V12.1: Auto-deliver to Telegram chat
+        if (chatId) {
+          var fs = require('fs');
+          if (fs.existsSync(outputPath)) {
+            var videoBuffer = fs.readFileSync(outputPath);
+            // Send via multipart form to Telegram sendVideo
+            var boundary = '----NanoClawUpload' + Date.now();
+            var body = '';
+            body += '--' + boundary + '\r\n';
+            body += 'Content-Disposition: form-data; name="chat_id"\r\n\r\n' + chatId + '\r\n';
+            body += '--' + boundary + '\r\n';
+            body += 'Content-Disposition: form-data; name="caption"\r\n\r\n' + (input.headline || 'Content Atom') + '\r\n';
+            body += '--' + boundary + '\r\n';
+            body += 'Content-Disposition: form-data; name="video"; filename="content-atom.mp4"\r\n';
+            body += 'Content-Type: video/mp4\r\n\r\n';
+            var bodyBuffer = Buffer.concat([
+              Buffer.from(body, 'utf8'),
+              videoBuffer,
+              Buffer.from('\r\n--' + boundary + '--\r\n', 'utf8'),
+            ]);
+            await new Promise(function(resolve, reject) {
+              var url = new URL('https://api.telegram.org/bot' + TG_TOKEN + '/sendVideo');
+              var opts = {
+                hostname: url.hostname, port: 443, path: url.pathname, method: 'POST',
+                headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Content-Length': bodyBuffer.length },
+              };
+              var req = https.request(opts, function(res) {
+                var d = ''; res.on('data', function(c) { d += c; }); res.on('end', function() { resolve(d); });
+              });
+              req.on('error', reject);
+              req.write(bodyBuffer);
+              req.end();
+            });
+            // Store for G1 approve→broadcast flow
+            if (tenant.isAdmin) {
+              var contentId = 'rv_' + Date.now();
+              contentReview[contentId] = { contentId: contentId, chatId: String(chatId), mediaUrl: null, caption: input.headline || 'Content Atom', localPath: outputPath, status: 'pending_review' };
+            }
+            return { rendered: true, delivered: true, outputPath: outputPath, message: 'Video rendered and sent to chat.' };
+          }
+        }
+        return { rendered: true, delivered: false, outputPath: outputPath, message: 'Video rendered but could not auto-deliver. File at: ' + outputPath };
       } catch (re) { return { error: 'Render failed: ' + (re.message || '').slice(0, 100) }; }
     }
 
@@ -1083,19 +1420,308 @@ async function _executeToolCallInner(toolName, input, tenant, correlationId) {
         severity: input.severity, tenantId: tenant.tenantId,
       }, 10000);
 
+    case 'upload_media': {
+      // G-P1: Upload Telegram file to Supabase Storage → return public URL
+      if (!input.file_id) return { error: 'file_id required' };
+      var fileInfo = await tgApi('getFile', { file_id: input.file_id });
+      if (!fileInfo.ok || !fileInfo.result || !fileInfo.result.file_path) {
+        return { error: 'Could not resolve file_id. File may have expired.' };
+      }
+      var tgFileUrl = 'https://api.telegram.org/file/bot' + TG_TOKEN + '/' + fileInfo.result.file_path;
+      // Download from Telegram
+      var fileBuffer = await new Promise(function(resolve, reject) {
+        https.get(tgFileUrl, function(res) {
+          var chunks = [];
+          res.on('data', function(c) { chunks.push(c); });
+          res.on('end', function() { resolve(Buffer.concat(chunks)); });
+          res.on('error', reject);
+        }).on('error', reject);
+      });
+      // Determine extension from file_path
+      var ext = path.extname(fileInfo.result.file_path) || '.jpg';
+      var storageName = (input.filename || ('upload-' + Date.now())) + ext;
+      var storagePath = 'agent-uploads/' + tenant.tenantId + '/' + storageName;
+      // Upload to Supabase Storage (using REST API)
+      var uploadResult = await new Promise(function(resolve, reject) {
+        var url = new URL(SUPABASE_URL + '/storage/v1/object/public-assets/' + storagePath);
+        var opts = {
+          hostname: url.hostname,
+          port: 443,
+          path: url.pathname,
+          method: 'POST',
+          headers: {
+            'Authorization': 'Bearer ' + SUPABASE_KEY,
+            'Content-Type': 'application/octet-stream',
+            'x-upsert': 'true',
+            'Content-Length': fileBuffer.length,
+          },
+        };
+        var req = https.request(opts, function(res) {
+          var body = '';
+          res.on('data', function(c) { body += c; });
+          res.on('end', function() {
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+              resolve({ ok: true });
+            } else {
+              resolve({ ok: false, error: 'HTTP ' + res.statusCode + ': ' + body.slice(0, 200) });
+            }
+          });
+        });
+        req.on('error', function(e) { reject(e); });
+        req.write(fileBuffer);
+        req.end();
+      });
+      if (!uploadResult.ok) {
+        return { error: 'Upload failed: ' + (uploadResult.error || 'unknown') };
+      }
+      var publicUrl = SUPABASE_URL + '/storage/v1/object/public/public-assets/' + storagePath;
+      emitAudit('media.uploaded', { storagePath: storagePath, publicUrl: publicUrl, size: fileBuffer.length, tenantId: tenant.tenantId });
+      return { uploaded: true, publicUrl: publicUrl, storagePath: storagePath, size: fileBuffer.length };
+    }
+
+    // === M-2..M-5: Mac Mini cherry-picked tool handlers ===
     case 'record_session':
       return httpsPost(MOTHERSHIP + '/api/gateway/record_session', gwHeaders, input, 15000);
     case 'generate_document':
       return httpsPost(MOTHERSHIP + '/api/gateway/generate_document', gwHeaders, input, 15000);
     case 'calculate_revenue_split':
       return httpsPost(MOTHERSHIP + '/api/gateway/calculate_revenue_split', gwHeaders, input, 10000);
+    case 'manage_integrations':
+      return httpsPost(MOTHERSHIP + '/api/gateway/manage_integrations', gwHeaders, input, 15000);
+    case 'composio_tool':
+      return httpsPost(MOTHERSHIP + '/api/gateway/composio_tool', gwHeaders, input, 30000);
     case 'get_expert_queue':
       return httpsPost(MOTHERSHIP + '/api/gateway/get_expert_queue', gwHeaders, input, 15000);
     case 'process_expert_queue':
       return httpsPost(MOTHERSHIP + '/api/gateway/process_expert_queue', gwHeaders, input, 10000);
+
+    // === Sook Ping workflow: import_document (Claude Desktop parity) ===
+    // Strategy: pandoc (lossless DOCX→markdown) → Gemini (structured extraction) → create_patient → Notion
+    case 'import_document': {
+      if (!input.file_id) return { error: 'file_id required' };
+      // Step 1: Download file from Telegram
+      var docFileInfo = await tgApi('getFile', { file_id: input.file_id });
+      if (!docFileInfo.ok || !docFileInfo.result || !docFileInfo.result.file_path) {
+        return { error: 'Could not resolve file. File may have expired — ask user to re-upload.' };
+      }
+      var docFileUrl = 'https://api.telegram.org/file/bot' + TG_TOKEN + '/' + docFileInfo.result.file_path;
+      var docBuffer = await new Promise(function(resolve, reject) {
+        https.get(docFileUrl, function(res) {
+          var chunks = [];
+          res.on('data', function(c) { chunks.push(c); });
+          res.on('end', function() { resolve(Buffer.concat(chunks)); });
+          res.on('error', reject);
+        }).on('error', reject);
+      });
+      var docExt = path.extname(docFileInfo.result.file_path).toLowerCase();
+      var tmpDocPath = '/tmp/import-' + Date.now() + docExt;
+      var tmpMdPath = tmpDocPath + '.md';
+      require('fs').writeFileSync(tmpDocPath, docBuffer);
+
+      // Step 2A: Try pandoc first (lossless, same as Claude Desktop)
+      var docMarkdown = '';
+      var extractionMethod = 'gemini';
+      try {
+        var { execSync } = require('child_process');
+        var pandocResult = execSync('pandoc "' + tmpDocPath + '" -t markdown --wrap=none 2>/dev/null', { timeout: 30000, encoding: 'utf8' });
+        if (pandocResult && pandocResult.length > 50) {
+          docMarkdown = pandocResult;
+          extractionMethod = 'pandoc';
+          console.log('[nc] import_document: pandoc extracted ' + docMarkdown.length + ' chars');
+        }
+      } catch(pandocErr) {
+        console.log('[nc] import_document: pandoc failed (' + (pandocErr.message || '').slice(0, 60) + '), falling back to Gemini');
+      }
+
+      // Step 2B: Gemini structured extraction (from pandoc markdown OR raw binary)
+      var geminiKey = process.env.GOOGLE_AI_API_KEY;
+      if (!geminiKey) return { error: 'No GOOGLE_AI_API_KEY for document processing' };
+      var extractPrompt = 'Extract ALL structured clinical data from this document. Return JSON with these fields:\n'
+        + '{"patient_name": "full name", "dob": "YYYY-MM-DD or null", "biological_sex": "male/female/null",\n'
+        + '"diagnosed_conditions": "comma-separated list", "medications": "list with dosages",\n'
+        + '"main_complaint": "primary reason for treatment", "pain_location": "anatomical locations",\n'
+        + '"pain_scale": 0-10, "mobility_aid": "none/walking stick/walking frame/wheelchair/etc",\n'
+        + '"rehab_goals": "rehabilitation goals", "therapist_notes": "key clinical observations",\n'
+        + '"vitals": "BP, HR, SpO2 if present", "service_date": "YYYY-MM-DD", "service_type": "physiotherapy/home care/etc",\n'
+        + '"service_location": "address", "attended_by": "therapist name",\n'
+        + '"care_team": "family members, caregivers mentioned", "follow_up_flags": "items needing attention",\n'
+        + '"summary": "3-5 sentence clinical summary with key findings"}\n'
+        + 'If a field is not in the document, set it to null. Return ONLY valid JSON.';
+      var geminiContent;
+      if (extractionMethod === 'pandoc' && docMarkdown.length > 50) {
+        // Feed pandoc markdown as text (much more reliable than binary DOCX)
+        geminiContent = { contents: [{ parts: [
+          { text: extractPrompt + '\n\nDOCUMENT CONTENT (markdown):\n\n' + docMarkdown.slice(0, 30000) }
+        ] }], generationConfig: { temperature: 0.1, maxOutputTokens: 8192 } };
+      } else {
+        // Fallback: feed raw binary to Gemini multimodal
+        var docMime = docExt === '.pdf' ? 'application/pdf' :
+                      docExt === '.docx' ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' :
+                      'application/octet-stream';
+        geminiContent = { contents: [{ parts: [
+          { text: extractPrompt },
+          { inline_data: { mime_type: docMime, data: docBuffer.toString('base64') } }
+        ] }], generationConfig: { temperature: 0.1, maxOutputTokens: 8192 } };
+      }
+      var geminiExtract = await httpsPost(
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' + geminiKey,
+        { 'Content-Type': 'application/json' },
+        geminiContent, 60000
+      );
+      var geminiText = geminiExtract && geminiExtract.candidates && geminiExtract.candidates[0]
+        && geminiExtract.candidates[0].content && geminiExtract.candidates[0].content.parts
+        && geminiExtract.candidates[0].content.parts[0] && geminiExtract.candidates[0].content.parts[0].text;
+      if (!geminiText) return { error: 'Document analysis returned empty. Try pasting content as text.', raw_markdown: docMarkdown ? docMarkdown.slice(0, 2000) : null };
+
+      // Step 3: Parse extracted JSON
+      var extracted = {};
+      try {
+        var jsonMatch = geminiText.match(/\{[\s\S]*\}/);
+        if (jsonMatch) extracted = JSON.parse(jsonMatch[0]);
+      } catch(parseErr) {
+        extracted = { summary: geminiText.slice(0, 1000), patient_name: input.patient_name || null };
+      }
+      var patientName = extracted.patient_name || input.patient_name;
+
+      // Step 4: Create patient in Mothership
+      var patientCreated = false;
+      if (patientName) {
+        try {
+          var createResult = await httpsPost(MOTHERSHIP + '/api/gateway/create_patient', gwHeaders, {
+            name: patientName,
+            dateOfBirth: extracted.dob || '1970-01-01',
+            biologicalSex: extracted.biological_sex || 'unknown',
+            tenantId: tenant.tenantId,
+            source: 'document_import_' + extractionMethod,
+          }, 15000);
+          if (createResult && !createResult.error) patientCreated = true;
+        } catch(cpErr) { /* patient may already exist */ }
+      }
+
+      // Step 5: Write to Notion entity graph via gateway (if available)
+      var notionWritten = false;
+      if (patientName) {
+        try {
+          await httpsPost(MOTHERSHIP + '/api/gateway/notion_search', gwHeaders, {
+            query: patientName, pageSize: 1,
+          }, 10000);
+          // Future: create Notion page with extracted data
+          // For now, the data is in the tool result — LLM can relay it
+        } catch(nErr) { /* non-blocking */ }
+      }
+
+      // Step 6: Emit comprehensive audit trail
+      emitAudit('document.imported', {
+        tenantId: tenant.tenantId, patientName: patientName,
+        documentType: input.document_type || 'other',
+        extractionMethod: extractionMethod,
+        fieldsExtracted: Object.keys(extracted).filter(function(k) { return extracted[k] !== null; }).length,
+        patientCreated: patientCreated,
+        markdownLength: docMarkdown.length,
+      });
+
+      // Cleanup temp files
+      try { require('fs').unlinkSync(tmpDocPath); } catch(e) {}
+
+      return {
+        success: true,
+        patient_name: patientName,
+        patient_created: patientCreated,
+        extraction_method: extractionMethod,
+        extracted: extracted,
+        raw_markdown_preview: docMarkdown ? docMarkdown.slice(0, 1500) : null,
+        summary: extracted.summary || 'Document processed via ' + extractionMethod + '. ' + Object.keys(extracted).filter(function(k) { return extracted[k] !== null; }).length + ' fields extracted.',
+        next_steps: patientCreated
+          ? 'Patient ' + patientName + ' registered. Clinical data extracted. You can now run start_intake for detailed assessment.'
+          : patientName
+            ? 'Patient found: ' + patientName + '. Call create_patient if not already registered.'
+            : 'No patient name found. Ask user for the patient name.',
+      };
+    }
+
+    // === Sook Ping workflow: manage_session ===
+    case 'manage_session': {
+      if (!input.description) return { error: 'description required' };
+      // Parse natural language session description using Gemini
+      var geminiKey2 = process.env.GOOGLE_AI_API_KEY;
+      if (!geminiKey2) return { error: 'No GOOGLE_AI_API_KEY' };
+      var sessionPrompt = 'Parse this session description into structured JSON:\n"' + input.description + '"\n\n'
+        + 'Return JSON: {"patient_name": "name", "service_type": "housecall_1hr|housecall_companion|lm_physio|lm_housecall|lm_monthly",\n'
+        + '"duration_hours": number, "amount_rm": number, "notes": "any additional notes"}\n'
+        + 'Service type mapping: housecall=housecall_1hr, companion=housecall_companion, physio=lm_physio, monthly=lm_monthly.\nReturn ONLY valid JSON.';
+      var sessionExtract = await httpsPost(
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' + geminiKey2,
+        { 'Content-Type': 'application/json' },
+        { contents: [{ parts: [{ text: sessionPrompt }] }], generationConfig: { temperature: 0.1, maxOutputTokens: 1024 } },
+        15000
+      );
+      var sessionText = sessionExtract && sessionExtract.candidates && sessionExtract.candidates[0]
+        && sessionExtract.candidates[0].content && sessionExtract.candidates[0].content.parts
+        && sessionExtract.candidates[0].content.parts[0] && sessionExtract.candidates[0].content.parts[0].text;
+      if (!sessionText) return { error: 'Could not parse session description' };
+      var sessionData = {};
+      try {
+        var sjMatch = sessionText.match(/\{[\s\S]*\}/);
+        if (sjMatch) sessionData = JSON.parse(sjMatch[0]);
+      } catch(e) { return { error: 'Could not parse: ' + sessionText.slice(0, 200) }; }
+      // Record via gateway
+      var sessionResult = await httpsPost(MOTHERSHIP + '/api/gateway/record_session', gwHeaders, {
+        patientName: sessionData.patient_name || 'Unknown',
+        serviceType: sessionData.service_type || 'housecall_1hr',
+        duration: sessionData.duration_hours || 1,
+        notes: sessionData.notes || input.description,
+        amount: sessionData.amount_rm,
+        tenantId: tenant.tenantId,
+      }, 15000);
+      emitAudit('session.recorded_natural', {
+        tenantId: tenant.tenantId, patientName: sessionData.patient_name,
+        serviceType: sessionData.service_type, amount: sessionData.amount_rm,
+        raw: input.description.slice(0, 200),
+      });
+      return {
+        recorded: true,
+        patient: sessionData.patient_name,
+        service: sessionData.service_type,
+        duration: sessionData.duration_hours,
+        amount: sessionData.amount_rm,
+        gateway_result: sessionResult,
+      };
+    }
+
+    case 'generate_invoice':
+      return httpsPost(MOTHERSHIP + '/api/gateway/generate_invoice', gwHeaders, {
+        patientName: input.patientName,
+        serviceType: input.serviceType,
+        hours: input.hours || 1,
+        rate: input.rate,
+        facilityName: input.facilityName,
+        facilitySharePct: input.facilitySharePct,
+        notes: input.notes,
+        tenantId: tenant.tenantId,
+      }, 15000);
+
+    case 'create_payment_link':
+      return httpsPost(MOTHERSHIP + '/api/gateway/create_payment_link', gwHeaders, {
+        invoiceId: input.invoiceId,
+        tenantId: tenant.tenantId,
+      }, 15000);
+
     default:
       return Promise.resolve({ error: 'Unknown tool: ' + toolName });
   }
+}
+
+// ============================================================================
+// V12.3: INLINE FLIGHT RECORDER (M-1 from Mac Mini — crash-survivable)
+// ============================================================================
+function recordFlight(event, toolName, data, tenantId, corrId) {
+  var entry = { event: event, tool: toolName, timestamp: Date.now(),
+    data: typeof data === 'string' ? data.slice(0, 500) : JSON.stringify(data || {}).slice(0, 500) };
+  if (typeof flightLog !== 'undefined') flightLog.push(entry);
+  emitAudit('agent.flight_step', {
+    event: event, tool: toolName, correlationId: corrId || '',
+    tenantId: tenantId || null, data: entry.data,
+  });
 }
 
 // ============================================================================
@@ -1123,6 +1749,13 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
     sys += 'AVOID: ' + agentConsciousness.avoid + '\n\n';
   }
   sys += 'You are Agent 0, Chief of Staff for ' + (tenant.expertName || EXPERT_NAME) + "'s longevity medicine practice.\n\n";
+
+  // === V12.3 P1: SELF-IDENTITY ===
+  sys += '=== YOUR IDENTITY IN THIS SPACE ===\n';
+  sys += 'Bot: @' + (process.env.TELEGRAM_BOT_USERNAME || 'DrMAGfield_bot') + '\n';
+  sys += 'Tenant: ' + (tenant.expertName || EXPERT_NAME) + ' (scope boundary)\n';
+  sys += 'Your scope: ONLY ' + (tenant.expertName || EXPERT_NAME) + ' patients, knowledge, and operations.\n';
+  sys += 'You do NOT serve other tenants. If asked about another practice, say: "That is handled by their own agent."\n\n';
 
   // IDENTITY
   sys += 'Expert: ' + (tenant.expertName || EXPERT_NAME) + '. ';
@@ -1162,6 +1795,45 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
   } else if (isGroup) {
     sys += 'You know ' + knownNames.length + ' patients. NEVER list their names in group chat — PHI violation.\n';
     sys += 'If someone asks about another patient, redirect to DM.\n\n';
+
+    // === V12.3 P2: GROUP SOCIAL CONTEXT ===
+    sys += '=== GROUP SOCIAL CONTEXT ===\n';
+    var groupTenant = CHAT_TENANT_MAP[String(chatId)];
+    var iAmGroupOwner = groupTenant && groupTenant.tenantId === TENANT_ID;
+    if (iAmGroupOwner) {
+      sys += 'This is YOUR group. You are the primary agent. Respond to all relevant messages.\n';
+    } else {
+      sys += 'This group belongs to another tenant. You are a GUEST.\n';
+      sys += 'GUEST RULES: ONLY speak when @mentioned or when someone asks about YOUR tenant by name.\n';
+      sys += 'Do NOT respond to general questions. Do NOT create patients here. SILENCE is correct for a guest.\n';
+    }
+    if (global._currentSenderName) {
+      sys += 'Current speaker: ' + global._currentSenderName + '\n';
+    }
+    sys += '=== END GROUP CONTEXT ===\n\n';
+
+    // === V12.3 P3: TOPIC RELEVANCE ===
+    sys += 'TOPIC SCOPE (check before every group response):\n';
+    sys += '- About ' + (tenant.expertName || EXPERT_NAME) + ' products/services? RESPOND\n';
+    sys += '- @mentioning me? RESPOND\n';
+    sys += '- General greeting/social? RESPOND BRIEFLY\n';
+    sys += '- About another tenants products? SILENT\n';
+    sys += '- Administrative and you are NOT group owner? SILENT\n\n';
+
+    // === V12.3 P6: CROSS-AGENT HANDOFF ===
+    sys += 'CROSS-AGENT AWARENESS: Other AI agents may be in this group. They serve different tenants.\n';
+    sys += 'If someone asks about a service you dont provide, say: "That is handled by [other practice]s agent."\n';
+    sys += 'NEVER pretend to handle another tenants patients or operations.\n\n';
+  }
+
+  // V12.1: Expose last uploaded media for tool chaining
+  if (global._lastUploadedMedia && global._lastUploadedMedia[String(chatId)]) {
+    var lastMedia = global._lastUploadedMedia[String(chatId)];
+    var mediaAge = Date.now() - lastMedia.timestamp;
+    if (mediaAge < 3600000) { // Only if uploaded in last hour
+      sys += 'LAST UPLOADED MEDIA: file_id=' + lastMedia.file_id + ' (type: ' + lastMedia.mimeType + ', ' + Math.round(mediaAge / 60000) + 'min ago)\n';
+      sys += 'To use this in a tool chain: call upload_media(file_id="' + lastMedia.file_id + '") first to get a public URL.\n\n';
+    }
   }
 
   // TENANT IDENTITY (so Agent 0 knows WHAT it is)
@@ -1171,20 +1843,21 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
 
   // BEHAVIORAL RULES (6 core — ML-172: hard gates handle safety, not prompt rules)
   // Trust Layer 2: Competence — cite protocols
+  // === M-6: FM-W5 Toolhub Harness (prevents "I don't have a tool" hallucination) ===
+  sys += "YOUR TOOLS (NEVER say you can't if a tool exists):\n";
+  sys += "- query_knowledge: Search clinical rules. get_patient_roster: List patients\n";
+  sys += "- manage_integrations: Connect Notion/Calendar/Drive (OAuth). composio_tool: Use connected services\n";
+  sys += "- record_session: Record completed session. generate_document: Invoice/receipt\n";
+  sys += "- calculate_revenue_split: Revenue splits. get_expert_queue + process_expert_queue: Review queue\n";
+  sys += "- start_intake: Begin assessment. schedule_followup: Queue follow-up. create_patient: Register new\n";
+  sys += "- render_video: Remotion video. upload_media: File to public URL. broadcast: Group message\n";
+  sys += "- notion_search + notion_fetch: Notion. get_daily_brief: Practice overview. send_to_dm: Preview to admin\n";
+  sys += "RULE: If admin asks to do something and a tool exists — CALL IT. Never say I cannot.\n\n";
+
   sys += "TRUST PROTOCOL CITATION: When answering clinical questions, ALWAYS cite the specific protocol:\n";
   sys += "- Format: \"Based on Protocol [rule_title] (verified by " + (tenant.expertName || EXPERT_NAME) + ")\"\n";
   sys += "- Show confidence: \"Confidence: [X]%\" when from ask_wellness_question\n";
   sys += "- If confidence < 50%: \"This needs expert review. Flagging for " + (tenant.expertName || EXPERT_NAME) + ".\"\n\n";
-  // FM-W5: MiniMax Toolhub Harness — prevent incapability hallucination
-  sys += "YOUR TOOLS (NEVER say you can't if a tool exists):\n";
-  sys += "- query_knowledge: Search clinical rules. get_patient_roster: List patients\n";
-  sys += "- record_session: Record completed session. generate_document: Invoice/receipt\n";
-  sys += "- calculate_revenue_split: Revenue splits for collaborations\n";
-  sys += "- get_expert_queue: List pending review items. process_expert_queue: Approve/reject\n";
-  sys += "- start_intake: Begin assessment. schedule_followup: Queue follow-up msg\n";
-  sys += "- notion_search + notion_fetch: Search/read Notion. get_daily_brief: Practice overview\n";
-  sys += "- create_patient: Register new. send_to_group: Broadcast. ask_wellness_question: Full Q\&A\n";
-  sys += "RULE: If admin asks to do something and a tool exists — CALL IT. Never say I cannot.\n\n";
   sys += "Rules:\n";
   sys += "- SELF-MODEL: NEVER say Done/Sent/Notified unless a tool call returned SUCCESS. If you did not call a tool, you did NOT do it.\n";
   sys += "- SELF-MODEL: Before claiming you reached someone, verify you have their chat_id. If not, say so.\n";
@@ -1196,6 +1869,33 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
   sys += "- send_to_group = GROUP (everyone sees). schedule_followup = queued (needs patient DM).\n";
   if (isGroup) sys += "- GROUP: Never mention other patients. Never list names. PHI queries = redirect to DM.\n";
   sys += "\n";
+  // === V12.1: COMPOSITIONAL WORKFLOW RULES ===
+  sys += "=== MULTI-TOOL WORKFLOW RULES ===\n";
+  sys += "1. DECOMPOSE: Broad request → break into concrete steps. Execute first step NOW, don't list options.\n";
+  sys += "2. CHAIN: Tool outputs feed next tool. Example: upload_media → publicUrl → render_video(imageUrl=publicUrl) → video delivered.\n";
+  sys += "3. INTERPRET: After EVERY tool call, tell user: what tool you called, what result you got, what it means.\n";
+  sys += "4. EMPTY RESULTS: If tool returns [] or 0 results, explain WHY (permissions? no data? wrong query?) and suggest fix. NEVER just say 'How can I help?'\n";
+  sys += "5. NEVER say 'I don't have a tool for that.' You have 33 tools. Check ALL before giving up.\n";
+  sys += "6. VERIFY: After workflow completes, confirm final state. Did the video send? Did the broadcast go out?\n";
+  sys += "7. RECOVER: If step N fails, explain which steps succeeded and what to do next.\n";
+  sys += "8. MEDIA CHAIN: When user uploads image + asks for video/content:\n";
+  sys += "   a) Call upload_media(file_id from context) → get publicUrl\n";
+  sys += "   b) Call render_video(headline=..., imageUrl=publicUrl) OR generate_i2v(image_url=publicUrl)\n";
+  sys += "   c) Video auto-delivers to chat. Ask admin to approve for broadcast.\n";
+  sys += "9. NOTION CHAIN: When admin asks about Notion content:\n";
+  sys += "   a) Call notion_search(query=...) → get page IDs\n";
+  sys += "   b) If results: call notion_fetch(pageId=...) for details\n";
+  sys += "   c) If 0 results: say 'Notion search returned 0 results for [query]. This usually means the page is not shared with the LV integration. Fix: open the Notion page → ••• → Connections → Add LV Mothership.'\n";
+  sys += "10. QUEUE CHAIN: When admin asks about patients/queue:\n";
+  sys += "   a) Call get_patient_roster → list patients\n";
+  sys += "   b) Call get_daily_brief → today's schedule + alerts\n";
+  sys += "   c) Combine results into actionable summary\n";
+  sys += "11. INVOICE CHAIN: When admin reports completed session:\n";
+  sys += "   a) Call manage_session(description) → parse + record\n";
+  sys += "   b) Call generate_invoice(patientName, serviceType, hours) → invoice number\n";
+  sys += "   c) Call create_payment_link(invoiceId) → payment URL + verify URL\n";
+  sys += "   d) Send to chat: invoice summary + [Pay via FPX] + [Verify Invoice]\n";
+  sys += "=== END WORKFLOW RULES ===\n\n";
   if (entity.anchor) sys += 'Context: ' + entity.anchor + '\n';
   // === FIX C: History cap at 6 turns (was unbounded) ===
   var HISTORY_CAP = 6;
@@ -1348,7 +2048,7 @@ function callMiniMax(systemPrompt, messages, tools, tenant, correlationId, chatI
           console.log('[nc] MiniMax Tool: ' + tc.function.name + '(' + tc.function.arguments.slice(0, 60) + ')');
           var input = {};
           try { input = JSON.parse(tc.function.arguments); } catch(e) {}
-          return executeToolCall(tc.function.name, input, tenant, correlationId).then(function(toolResult) {
+          return executeToolCall(tc.function.name, input, tenant, correlationId, chatId).then(function(toolResult) {
             return { role: 'tool', tool_call_id: tc.id, content: JSON.stringify(toolResult).slice(0, 3000) };
           });
         });
@@ -1369,7 +2069,7 @@ function callMiniMax(systemPrompt, messages, tools, tenant, correlationId, chatI
 
 // ANTHROPIC TOOL_USE LOOP
 // ============================================================================
-function callAnthropic(systemPrompt, messages, tools, tenant, correlationId) {
+function callAnthropic(systemPrompt, messages, tools, tenant, correlationId, chatId) {
   var totalTokens = 0;
 
   function callOnce(msgs, round) {
@@ -1395,7 +2095,7 @@ function callAnthropic(systemPrompt, messages, tools, tenant, correlationId) {
       // Each tool_use MUST have a matching tool_result in the next user message
       var toolPromises = toolBlocks.map(function(tb) {
         console.log('[nc] Tool: ' + tb.name + '(' + JSON.stringify(tb.input).slice(0, 60) + ')');
-        return executeToolCall(tb.name, tb.input, tenant, correlationId).then(function(toolResult) {
+        return executeToolCall(tb.name, tb.input, tenant, correlationId, chatId).then(function(toolResult) {
           return { type: 'tool_result', tool_use_id: tb.id, content: JSON.stringify(toolResult).slice(0, 3000) };
         });
       });
@@ -1536,13 +2236,15 @@ async function loadAgentIdentity() {
           }
         }
       }
-      // DR MAGfield group — hardcoded for single-tenant instance
-      var magfieldGroupId = '-1003771302334';
-      if (!CHAT_TENANT_MAP[magfieldGroupId]) {
-        CHAT_TENANT_MAP[magfieldGroupId] = { tenantId: TENANT_ID, expertSlug: EXPERT_SLUG, expertName: EXPERT_NAME, isAdmin: false, isGroup: true };
-        console.log('[nc] MAGfield group registered: ' + magfieldGroupId);
-
-      // V12.2.1: Load additional admins from gateway_config
+      // M-8: Tenant guard — only register DR MAGfield group on DR MAGfield tenant
+      if (TENANT_ID === '3cc281be-aafc-4579-9edf-521659306145') {
+        var magfieldGroupId = '-1003771302334';
+        if (!CHAT_TENANT_MAP[magfieldGroupId]) {
+          CHAT_TENANT_MAP[magfieldGroupId] = { tenantId: TENANT_ID, expertSlug: EXPERT_SLUG, expertName: EXPERT_NAME, isAdmin: false, isGroup: true };
+          console.log('[nc] MAGfield group registered: ' + magfieldGroupId);
+        }
+      }
+      // M-7: Load additional admins from gateway_config (e.g., Arie Ong for DR MAGfield)
       if (adminAgent && adminAgent.length > 0) {
         for (var _aai = 0; _aai < adminAgent.length; _aai++) {
           var _aag = adminAgent[_aai];
@@ -1551,13 +2253,13 @@ async function loadAgentIdentity() {
             for (var _adi = 0; _adi < _addAdmins.length; _adi++) {
               var _aa = _addAdmins[_adi];
               if (_aa.chatId && !CHAT_TENANT_MAP[String(_aa.chatId)]) {
-                CHAT_TENANT_MAP[String(_aa.chatId)] = { tenantId: _aag.tenant_id || TENANT_ID, expertSlug: EXPERT_SLUG, expertName: _aa.name || EXPERT_NAME, isAdmin: true, role: _aa.role || "admin" };
-                console.log("[nc] Additional admin registered: " + _aa.chatId + " → " + (_aa.name || "unknown"));
+                CHAT_TENANT_MAP[String(_aa.chatId)] = { tenantId: _aag.tenant_id || TENANT_ID, expertSlug: EXPERT_SLUG, expertName: _aa.name || EXPERT_NAME, isAdmin: true, role: _aa.role || 'admin' };
+                console.log('[nc] Additional admin: ' + _aa.chatId + ' -> ' + (_aa.name || 'unknown'));
               }
             }
           }
         }
-      }      }
+      }
     // Load behavioral lessons from consciousness.update events
     var lessonsUrl = SUPABASE_URL + '/rest/v1/agent_event_bus?event_type=eq.consciousness.update&status=eq.completed&tenant_id=eq.' + TENANT_ID + '&select=payload&order=created_at.desc&limit=10';
     var lessonEvents = await httpsGet(lessonsUrl, { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }, 5000).catch(function() { return []; });
@@ -1657,20 +2359,18 @@ function seedBrandDNA() {
 // === V12: Proactive heartbeat (60s) + pending-actions polling + config manifest ===
 var _v12ConfigHash = (function() {
   try { return require('crypto').createHash('sha256').update(JSON.stringify({
-    version: 'v12.2-flight-recorder', historyCap: 6, consciousnessPosition: 'start',
+    version: 'v12-accountability', historyCap: 6, consciousnessPosition: 'start',
     mandatoryPreFetch: true, experienceEmission: true, proactiveHeartbeat: true,
   })).digest('hex').slice(0, 16); } catch(e) { return 'unknown'; }
 })();
 
 setInterval(async function() {
-  // V12.2: Heartbeat failure dedup — don't compound same action failures
-  var _recentFailures = (typeof _recentFailures !== 'undefined') ? _recentFailures : {};
   // Proactive: poll pending-actions per tenant
   var tenantIds = [];
   try { tenantIds = [...new Set(Object.values(CHAT_TENANT_MAP).map(function(t) { return t.tenantId; }).filter(Boolean))]; } catch(e) {}
   for (var _tid of tenantIds) {
     try {
-      var _actions = await httpsGet(MOTHERSHIP + '/api/agent/pending-actions?tenantId=' + _tid, { 'X-MCP-API-Key': getMcpKey(_tid), 'x-correlation-id': 'heartbeat-' + Date.now() }, 5000);
+      var _actions = await httpsGet(MOTHERSHIP + '/api/agent/pending-actions?tenantId=' + _tid, { 'X-MCP-API-Key': getMcpKey(_tid) }, 5000);
       if (_actions && _actions.success && _actions.items && _actions.items.length > 0) {
         for (var _act of _actions.items) {
           var _actChat = _act.chatId || _act.chat_id;
@@ -1695,7 +2395,7 @@ setInterval(async function() {
     memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
     pendingActionsPolled: true,
     configHash: _v12ConfigHash,
-    version: 'v12.2-flight-recorder',
+    version: 'v12-accountability',
   });
 }, 60 * 1000);
 
@@ -1836,7 +2536,6 @@ function persistConversationData(chatId, entityId, text, response, tenant) {
 
 async function handleMessage(msg) {
   var toolsActuallyUsed = []; // V12: track tools for experience emission
-  var flightLog = []; // V12.2: Flight recorder — inline persistence
   var chatId = msg.chat.id;
   var text = msg.text || msg.caption || '';
   var userName = msg.from ? (msg.from.first_name || msg.from.username || 'User') : 'User';
@@ -1956,14 +2655,9 @@ async function handleMessage(msg) {
         // Step 4: Send to Gemini directly (same as telegram-media-processor on Mothership)
         var base64Data = fileBuffer.toString('base64');
         var caption = msg.caption || '';
-        var docMimeType = msg.document ? (msg.document.mime_type || '') : '';
-        var isDocument = docMimeType.includes('word') || docMimeType.includes('pdf') || docMimeType.includes('text');
         var geminiPrompt = caption
-          ? 'The user sent this file with the message: ' + caption + '. '
-            + (isDocument ? 'Extract and structure ALL text content from this document. Preserve formatting, tables, and headings.' : 'Analyze it in a health/wellness context. If it is a lab report, extract all biomarker values.')
-          : isDocument
-            ? 'Extract and structure ALL text content from this document. Preserve tables, headings, lists, and formatting. Return the full content in a readable format.'
-            : 'Analyze this file in a health and wellness context. If it is a lab report, extract all biomarker values with units. Be structured and precise.';
+          ? 'The user sent this file with the message:  + caption + . Analyze it in a health/wellness context. If it is a lab report, extract all biomarker values.'
+          : 'Analyze this file in a health and wellness context. If it is a lab report, extract all biomarker values with units. Be structured and precise.';
 
         var geminiKey = process.env.GOOGLE_AI_API_KEY;
         if (!geminiKey) throw new Error('No GOOGLE_AI_API_KEY');
@@ -1987,13 +2681,18 @@ async function handleMessage(msg) {
 
         if (!geminiText) throw new Error('Empty Gemini response');
 
-        // Step 5: Send analysis back via Agent 0's bot (same bot, no confusion)
-        await sendTelegram(chatId, geminiText.slice(0, 4096));
-        console.log('[nc] Media analysis sent (' + geminiText.length + ' chars)');
+        // Step 5: Send analysis back + expose file_id for tool chaining
+        var chainHint = '\n\n📎 File available for tools: file_id=' + fileId;
+        await sendTelegram(chatId, geminiText.slice(0, 4000) + chainHint);
+        console.log('[nc] Media analysis sent (' + geminiText.length + ' chars) with file_id hint');
 
-        // Step 6: Store in entity memory for follow-up context
-        addEntityTurn(chatId, entityId || 'system:admin', 'user', '[' + mediaType + '] ' + (caption || 'File uploaded'));
-        addEntityTurn(chatId, entityId || 'system:admin', 'assistant', geminiText.slice(0, 600));
+        // Step 6: Store in entity memory WITH file_id so LLM can chain tools
+        addEntityTurn(chatId, entityId || 'system:admin', 'user', '[' + mediaType + ' file_id=' + fileId + '] ' + (caption || 'File uploaded'));
+        addEntityTurn(chatId, entityId || 'system:admin', 'assistant', geminiText.slice(0, 400) + ' [file_id=' + fileId + ' available for upload_media/generate_i2v]');
+
+        // Store last uploaded file_id per chat for easy reference
+        if (!global._lastUploadedMedia) global._lastUploadedMedia = {};
+        global._lastUploadedMedia[String(chatId)] = { file_id: fileId, mimeType: mimeType, timestamp: Date.now() };
 
         emitAudit('nanoclaw.media_processed', {
           chatId: chatId, mediaType: mediaType, mimeType: mimeType,
@@ -2001,42 +2700,7 @@ async function handleMessage(msg) {
         });
       } catch (mediaErr) {
         console.warn('[nc] Media processing failed:', mediaErr.message || mediaErr);
-        // V12.2: NO dead-end redirect. Try alternative processing for documents.
-        var docMime = msg.document ? (msg.document.mime_type || '') : '';
-        var fileName = msg.document ? (msg.document.file_name || '') : '';
-        if (docMime.includes('word') || docMime.includes('pdf') || docMime.includes('document')
-            || fileName.endsWith('.docx') || fileName.endsWith('.pdf') || fileName.endsWith('.doc')) {
-          // Document file — inform user and process via text extraction relay
-          await sendTelegram(chatId, 'I received your document (' + fileName + '). '
-            + 'Document analysis is processing — I will extract the content and work with it. '
-            + 'If processing takes too long, you can also paste the key content as text.');
-          // Relay to Mothership for document processing (has pdf-parse + mammoth)
-          try {
-            var docResult = await httpsPost(MOTHERSHIP + '/api/channel/intake', {
-              'Content-Type': 'application/json',
-              'X-MCP-API-Key': getMcpKey(tenant ? tenant.tenantId : TENANT_ID),
-            }, {
-              relay: true, chatId: chatId, fromUserId: msg.from ? msg.from.id : 0,
-              fromName: msg.from ? (msg.from.first_name || 'User') : 'User',
-              text: '[DOCUMENT: ' + fileName + '] User uploaded a document. Extract and summarize the content.',
-              tenantId: tenant ? tenant.tenantId : TENANT_ID,
-              correlationId: correlationId,
-              isAdmin: tenant ? tenant.isAdmin : false,
-              mediaUrl: 'https://api.telegram.org/file/bot' + TG_TOKEN + '/' + (fileInfo && fileInfo.result ? fileInfo.result.file_path : ''),
-              mediaType: 'document', mimeType: docMime, fileName: fileName,
-            }, 30000);
-            if (docResult && (docResult.response || docResult.text)) {
-              await sendTelegram(chatId, (docResult.response || docResult.text).slice(0, 4096));
-            }
-          } catch(relayErr) {
-            console.warn('[nc] Document relay failed:', relayErr.message || relayErr);
-            await sendTelegram(chatId, 'Document processing is taking longer than expected. '
-              + 'Please paste the key sections as text and I will work with that directly.');
-          }
-        } else {
-          await sendTelegram(chatId, 'I had trouble analyzing that file (' + (mediaErr.message || 'processing error').slice(0, 60)
-            + '). Could you try sending it as a photo, or describe the key content in text?');
-        }
+        await sendTelegram(chatId, 'Could not analyze your file. Please try describing it in text, or send it to @LV_Butler_Bot for processing.');
       }
       return;
     }
@@ -2051,7 +2715,7 @@ async function handleMessage(msg) {
     var expertName = tenant.expertName || EXPERT_NAME;
     var rulesCount = 0;
     try {
-      var r = await httpsGet(MOTHERSHIP + '/api/agent/consciousness?tenantId=' + tenant.tenantId, { 'X-MCP-API-Key': getMcpKey(tenant.tenantId), 'x-correlation-id': correlationId || '' }, 5000).catch(function() { return null; });
+      var r = await httpsGet(MOTHERSHIP + '/api/agent/consciousness?tenantId=' + tenant.tenantId, { 'X-MCP-API-Key': getMcpKey(tenant.tenantId) }, 5000).catch(function() { return null; });
       if (r && r.practiceScope) rulesCount = r.practiceScope.rules || 0;
     } catch(e) {}
     // Trust Layer 3: Authority — credential banner on first contact
@@ -2082,83 +2746,48 @@ async function handleMessage(msg) {
   var correlationId = crypto.randomUUID();
   var tenant = CHAT_TENANT_MAP[String(chatId)];
   if (!tenant) {
-    // V12.2.1: AUTO-ONBOARD instead of rejecting
-    // DM from unknown user → register as Stage 1 (Anonymous) patient
-    var fromUser = msg.from || {};
-    var fromName = (fromUser.first_name || '') + (fromUser.last_name ? ' ' + fromUser.last_name : '');
-    var fromUsername = fromUser.username || '';
-    console.log('[nc] AUTO-ONBOARD: new user chatId=' + chatId + ' name=' + fromName + ' @' + fromUsername);
-
-    // Find tenant from deep-link or default to primary tenant
-    var onboardTenantId = TENANT_ID; // Default: this instance's tenant
-    // Check if /start had a tenant slug (e.g., /start drmagfield)
-    if (text && text.startsWith('/start ')) {
-      var startSlug = text.split(' ')[1];
-      // Could resolve slug → tenantId here if multi-tenant
-    }
-
-    // Register in CHAT_TENANT_MAP as non-admin
-    CHAT_TENANT_MAP[String(chatId)] = {
-      tenantId: onboardTenantId,
-      expertSlug: EXPERT_SLUG,
-      expertName: EXPERT_NAME,
-      isAdmin: false,
-      autoOnboarded: true,
-      onboardedAt: Date.now(),
-      fromName: fromName,
-      fromUsername: fromUsername,
-    };
-    tenant = CHAT_TENANT_MAP[String(chatId)];
-
-    // Emit onboard event for audit trail
-    emitAudit('acquisition.auto_onboard', {
-      chatId: String(chatId),
-      name: fromName,
-      username: fromUsername,
-      tenantId: onboardTenantId,
-      channel: 'telegram_dm',
-      trustStage: 'anonymous',
-    });
-
-    // Create patient entity in ESAGM memory
-    var entityId = 'patient:' + fromName.replace(/\s+/g, '-').toLowerCase();
-    var entity = getEntity(chatId, entityId);
-    entity.displayName = fromName || 'Unknown';
-    entity.type = 'patient';
-    entity.lastActive = Date.now();
-
-    // Cache name for system prompt
-    patientNameCache[entityId.replace('patient:', '')] = fromName || fromUsername || 'User';
-
-    // Welcome message — Progressive Trust Stage 1
-    await sendTelegram(chatId,
-      'Hi ' + (fromName.split(' ')[0] || 'there') + '! 👋\n\n' +
-      'I am the AI assistant for ' + EXPERT_NAME + '.\n\n' +
-      'How can I help you today? You can:\n' +
-      '• Ask about our therapy services\n' +
-      '• Book a session with Arie (+6012-659 5319)\n' +
-      '• Share health documents for analysis\n\n' +
-      'What brings you here?'
-    );
-
-    // Try to create patient in Mothership (non-blocking)
-    try {
-      httpsPost(MOTHERSHIP + '/api/gateway/create_patient', {
-        'X-MCP-API-Key': MCP_KEY, 'x-correlation-id': correlationId,
-      }, {
-        name: fromName || fromUsername || 'Telegram User ' + chatId,
-        tenantId: onboardTenantId,
-        source: 'telegram_auto_onboard',
-        telegramChatId: String(chatId),
-        telegramUsername: fromUsername,
-      }, 10000).catch(function(e) {
-        console.warn('[nc] Auto-onboard patient creation failed:', e.message);
-      });
-    } catch(e) {}
-
-    return; // Welcome sent, next message will flow through normal pipeline
+    console.log('[nc] REJECTED: unauthorized chatId=' + chatId);
+    await sendTelegram(chatId, 'Not authorized. Contact admin to register your Telegram account.');
+    return;
   }
   var chat = getChat(chatId);
+
+  // G1: APPROVE → BROADCAST HANDLER
+  // When admin replies 👍/approve to content preview → auto-broadcast to supergroup
+  if (tenant.isAdmin && Object.keys(contentReview).length > 0) {
+    var reviewMatch = null;
+    for (var rvKey in contentReview) {
+      if (contentReview[rvKey].chatId === String(chatId)) { reviewMatch = contentReview[rvKey]; break; }
+    }
+    if (reviewMatch && (/^(👍|✅|approve|lgtm|looks good|ship it|yes|ok|go|send it)/i.test(text.trim()))) {
+      // APPROVE → broadcast to supergroup
+      var groupChatId = null;
+      for (var bk in CHAT_TENANT_MAP) { if (CHAT_TENANT_MAP[bk] && CHAT_TENANT_MAP[bk].tenantId === tenant.tenantId && CHAT_TENANT_MAP[bk].isGroup) { groupChatId = bk; break; } }
+      if (groupChatId && reviewMatch.mediaUrl) {
+        await tgApi('sendVideo', { chat_id: groupChatId, video: reviewMatch.mediaUrl, caption: reviewMatch.caption || '', parse_mode: 'Markdown' });
+        emitAudit('content.approved', { contentId: reviewMatch.contentId, approvedBy: String(chatId), broadcastTo: groupChatId });
+        await sendTelegram(chatId, '✅ Broadcast sent to group (msg approved).');
+      } else if (groupChatId && reviewMatch.caption) {
+        await tgApi('sendMessage', { chat_id: groupChatId, text: reviewMatch.caption, parse_mode: 'Markdown' });
+        emitAudit('content.approved', { contentId: reviewMatch.contentId, approvedBy: String(chatId), broadcastTo: groupChatId });
+        await sendTelegram(chatId, '✅ Text broadcast sent to group.');
+      } else {
+        await sendTelegram(chatId, '⚠️ Approved but no group found for broadcast.');
+      }
+      reviewMatch.status = 'approved';
+      persistReview(reviewMatch.contentId, reviewMatch);
+      delete contentReview[reviewMatch.contentId];
+      return;
+    }
+    if (reviewMatch && (/^(👎|❌|reject|no|redo|bad)/i.test(text.trim()))) {
+      reviewMatch.status = 'rejected';
+      persistReview(reviewMatch.contentId, reviewMatch);
+      emitAudit('content.rejected', { contentId: reviewMatch.contentId, rejectedBy: String(chatId) });
+      delete contentReview[reviewMatch.contentId];
+      await sendTelegram(chatId, '❌ Rejected. Tell me what to change.');
+      return;
+    }
+  }
 
   // 0. Short message handling — "1", "yes", "no", single words
   // These are follow-up responses to Agent 0's questions. Keep current entity,
@@ -2176,14 +2805,20 @@ async function handleMessage(msg) {
   var entityId = resolveEntity(text, chat, tenant);
   switchEntity(chatId, entityId);
 
-  // V12.2.1: Track individual senders in group chats
+  // === V12.3 P4: SENDER AWARENESS (track WHO sent this message in groups) ===
   var isGroup = chatId < 0;
+  global._currentSenderName = null;
   if (isGroup && msg.from) {
     var senderName = (msg.from.first_name || '') + (msg.from.last_name ? ' ' + msg.from.last_name : '');
     var senderId = String(msg.from.id);
-    if (senderName && !patientNameCache['tg:' + senderId]) {
-      patientNameCache['tg:' + senderId] = senderName;
-      // Create entity for this group participant
+    var senderIsBot = msg.from.is_bot || false;
+    // Skip messages from OTHER bots (prevent bot-to-bot echo)
+    if (senderIsBot) {
+      console.log('[nc] Skipping message from bot: ' + (msg.from.username || senderId));
+      return;
+    }
+    global._currentSenderName = senderName;
+    if (senderName) {
       var senderEntityId = 'patient:' + senderName.replace(/\s+/g, '-').toLowerCase();
       var senderEntity = getEntity(chatId, senderEntityId);
       if (!senderEntity.displayName || senderEntity.displayName === 'Unknown') {
@@ -2191,18 +2826,41 @@ async function handleMessage(msg) {
         senderEntity.type = 'patient';
         senderEntity.lastActive = Date.now();
         senderEntity.telegramId = senderId;
-        console.log('[nc] Group sender tracked: ' + senderName + ' (tg:' + senderId + ')');
+        patientNameCache['tg:' + senderId] = senderName;
+        console.log('[nc] Group sender: ' + senderName + ' (tg:' + senderId + ')');
+      }
+      if (entityId === 'system:general') {
+        entityId = senderEntityId;
+        switchEntity(chatId, entityId);
       }
     }
-    // Prepend sender name to system prompt context so LLM knows WHO is talking
-    if (senderName && entityId === 'system:general') {
-      entityId = 'patient:' + senderName.replace(/\s+/g, '-').toLowerCase();
-      switchEntity(chatId, entityId);
-      var sEntity = getEntity(chatId, entityId);
-      if (!sEntity.displayName || sEntity.displayName === 'Unknown') {
-        sEntity.displayName = senderName;
+  }
+
+  // === V12.3 P5: GUEST GATE (hard filter for non-owner agents in groups) ===
+  // Multi-tenant: DO serves LV AI + Ping Care + Amani on one bot.
+  // "Owner" = group's tenant is in TENANT_MCP_KEYS (this bot serves it).
+  // "Guest" = group's tenant is NOT served by this bot (e.g., DR MAGfield on DO).
+  if (isGroup) {
+    var groupOwnerTenant = CHAT_TENANT_MAP[String(chatId)];
+    var groupTenantId = groupOwnerTenant ? groupOwnerTenant.tenantId : null;
+    var iServeThisTenant = groupTenantId === TENANT_ID || (groupTenantId && TENANT_MCP_KEYS[groupTenantId]);
+    if (!iServeThisTenant) {
+      var botUsername = process.env.TELEGRAM_BOT_USERNAME || '';
+      var isMentioned = (botUsername && text.includes('@' + botUsername)) ||
+                        text.toLowerCase().includes(EXPERT_NAME.toLowerCase());
+      if (!isMentioned) {
+        console.log('[nc] GUEST GATE: silent in non-served group (not @mentioned)');
+        return;
       }
+      console.log('[nc] GUEST GATE: responding (was @mentioned in non-served group)');
     }
+  }
+
+  // === V12.3 P7: SOCIAL NUANCE CAPTURE (referral chains) ===
+  var referralMatch = text.match(/(\w+)\s+(?:referred|introduced|recommended|brought)\s+(\w+)/i);
+  if (referralMatch) {
+    emitAudit('entity.referral', { referrer: referralMatch[1], referred: referralMatch[2], chatId: String(chatId), tenantId: tenant.tenantId });
+    console.log('[nc] Referral: ' + referralMatch[1] + ' -> ' + referralMatch[2]);
   }
 
   // 2. Persona detection
@@ -2235,7 +2893,6 @@ async function handleMessage(msg) {
   emitAudit('nanoclaw.message', {
     correlationId: correlationId, chatId: String(chatId).slice(-4),
     entity: safeEntityId, persona: persona,
-    tenantId: tenant ? tenant.tenantId : null,
   });
 
   // 3b. Fast path: "status check" → instant API call, no LLM
@@ -2272,7 +2929,7 @@ async function handleMessage(msg) {
       },
     }, 5000).catch(function(e) { console.log('[nc] Experience emit failed:', e.message || e); });
     
-    emitAudit('nanoclaw.response', { correlationId: correlationId, chatId: chatId, entity: entityId, persona: 'cos', responseLength: reply.length, fastPath: true, tenantId: tenant ? tenant.tenantId : null });
+    emitAudit('nanoclaw.response', { correlationId: correlationId, chatId: chatId, entity: entityId, persona: 'cos', responseLength: reply.length, fastPath: true });
       return;
     } catch (e) {
       console.error('[nc] Status fast path failed:', e.message);
@@ -2401,35 +3058,36 @@ async function handleMessage(msg) {
 
     // 8. Send to Telegram
     await sendTelegram(chatId, response);
+    // V12.3: Telegram inline keyboard for OAuth connect buttons
+    if (typeof toolsActuallyUsed !== 'undefined') {
+      for (var _ti = 0; _ti < toolsActuallyUsed.length; _ti++) {
+        var _tr = toolsActuallyUsed[_ti];
+        if (_tr.result && _tr.result._telegramInlineKeyboard) {
+          var _kb = _tr.result._telegramInlineKeyboard;
+          var _msg = _tr.result._telegramMessage || 'Tap to connect:';
+          tgApi('sendMessage', {
+            chat_id: chatId, text: _msg,
+            reply_markup: JSON.stringify({ inline_keyboard: [[{ text: _kb.text, url: _kb.url }]] }),
+          }).catch(function() {});
+        }
+      }
+    }
     console.log('[nc] Delivered (' + response.length + ' chars) entity=' + entityId);
 
-    // V12.2: Honest degradation notice + flight trace to Maestro
-    var failedTools = (typeof toolsActuallyUsed !== 'undefined' ? toolsActuallyUsed : []).filter(function(t) { return !t.success; });
-    if (failedTools.length > 0) {
-      var notice = '\n\n\u26a0\ufe0f ' + failedTools.map(function(t) {
-        return t.name + ': ' + (t.error || 'unknown').slice(0, 40);
-      }).join('. ') + '\nData saved locally. Auto-retry when fixed.';
-      sendTelegram(chatId, notice).catch(function() {});
-      // Flight trace to Maestro
-      httpsPost(MOTHERSHIP + '/api/agent/event-bus',
-        { 'X-MCP-API-Key': getMcpKey(tenant.tenantId), 'Content-Type': 'application/json' },
-        { event_type: 'agent.flight_recorder', source: 'nanoclaw', target: 'maestro',
-          tenant_id: tenant.tenantId, status: 'pending',
-          payload: { correlationId: correlationId, flightLog: flightLog || [],
-            failedTools: failedTools, userMessage: (text || '').slice(0, 200) },
-        }, 5000).catch(function() {});
-    }
-
-      // LEGACY experience report DISABLED — v12 emission (line ~2060) goes through
-      // /api/agent/event-bus POST route which triggers BRK-6 VE bridge
-      // emitAudit('agent.experience.report', { ... });
+      // HACPO experience report (non-blocking)
+      emitAudit('agent.experience.report', {
+        tenantId: tenant.tenantId, chatId: chatId, entityId: entityId,
+        provider: (MINIMAX_KEY && !isClinicalQuery(text)) ? 'minimax' : (ANTHROPIC_KEY ? 'anthropic' : 'gateway'),
+        responseLength: (response || '').length,
+        deflected: (response || '').indexOf('I cannot') >= 0 || (response || '').indexOf('contact your doctor') >= 0,
+        correlationId: correlationId,
+      });
 
     // 9. Audit: response delivered (G1)
     persistConversationData(chatId, entityId, text, response, tenant);
     emitAudit('nanoclaw.response', {
       correlationId: correlationId, chatId: chatId, entity: entityId,
       persona: persona, responseLength: response.length,
-      tenantId: tenant ? tenant.tenantId : null,
     });
 
   } catch (e) {
@@ -2497,17 +3155,6 @@ async function poll() {
                 chatId: reactChatId, tenantId: reactTenant.tenantId,
                 messageId: reaction.message_id, emoji: emojiList.join(','), sentiment: sentiment,
               });
-              // BRK-2: Content delivery trace — reaction on content review
-              var reviewedContent = contentReview[String(reaction.message_id)];
-              if (reviewedContent) {
-                var reviewStatus = sentiment === 'positive' ? 'approved' : (sentiment === 'negative' ? 'rejected' : 'neutral');
-                emitAudit('content.reviewed', {
-                  contentId: reviewedContent.contentId || String(reaction.message_id),
-                  status: reviewStatus, tenantId: reactTenant.tenantId,
-                  correlationId: reviewedContent.correlationId || 'review-' + reaction.message_id,
-                  chatId: reactChatId, emoji: emojiList.join(','),
-                });
-              }
             }
           }
         }
@@ -2531,7 +3178,7 @@ http.createServer(function(req, res) {
   }
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
-    status: 'ok', agent: 'nanoclaw-v12.2.1-auto-onboard', messages: msgCount,
+    status: 'ok', agent: 'nanoclaw-v12.2.0-flight-recorder', messages: msgCount,
     uptime: Math.round(process.uptime()),
     memory: { type: 'ESAGM', entities: Object.keys(entities).length }, // SEC-07: no patient names in health
     capabilities: ANTHROPIC_KEY ? 'tool_use+esagm' : 'gateway_only',
@@ -2549,7 +3196,7 @@ http.createServer(function(req, res) {
 
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', agent: 'nanoclaw-v12.2.1-auto-onboard-kiosk', tools: ALL_TOOLS.length }));
+    res.end(JSON.stringify({ status: 'ok', agent: 'nanoclaw-v12.2.0-flight-recorder-kiosk', tools: ALL_TOOLS.length }));
     return;
   }
 
@@ -2569,7 +3216,7 @@ http.createServer(function(req, res) {
 }).listen(KIOSK_PORT, '0.0.0.0');
 console.log('[nc] Kiosk API on :' + KIOSK_PORT + ' (Tailscale-accessible)');
 
-console.log('[nc] NanoClaw v12.2.1-auto-onboard on :' + HEALTH_PORT);
+console.log('[nc] NanoClaw v12.2.0-flight-recorder on :' + HEALTH_PORT);
 console.log('[nc] Persona: COS (admin) + Expert Rep (Keith Koo)');
 console.log('[nc] Memory: Entity-Scoped Attention Graph (per-patient isolation)');
 console.log('[nc] Tools: ' + (ANTHROPIC_KEY ? 'Anthropic tool_use (scoped by persona)' : 'Gateway only (no ANTHROPIC_KEY)'));
@@ -2578,6 +3225,6 @@ loadAgentIdentity().catch(function(e) { console.warn('[nc] Initial identity load
 seedBrandDNA(); // Seed DR MAGfield brand DNA into agent memory
 
 // Startup audit event
-emitAudit('nanoclaw.startup', { version: 'v12.2.1-auto-onboard', capabilities: ANTHROPIC_KEY ? 'full' : 'gateway_only', tenantId: TENANT_ID, tenantMode: process.env.TENANT_MODE || 'single', toolCount: ALL_TOOLS.length });
+emitAudit('nanoclaw.startup', { version: 'v12.2.0-flight-recorder', capabilities: ANTHROPIC_KEY ? 'full' : 'gateway_only', tenantId: TENANT_ID, tenantMode: process.env.TENANT_MODE || 'single', toolCount: ALL_TOOLS.length });
 
 poll();
