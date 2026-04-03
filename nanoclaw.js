@@ -2059,7 +2059,7 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
   if (agentConsciousness && agentConsciousness.avoid) {
     sys += 'AVOID: ' + agentConsciousness.avoid + '\n\n';
   }
-  sys += 'You are Agent 0, Chief of Staff for ' + (tenant.expertName || EXPERT_NAME) + "'s longevity medicine practice.\n\n";
+  sys += 'You are Agent 0, Chief of Staff for ' + (tenant.expertName || EXPERT_NAME) + "'s practice.\n\n";
 
   // === V12.3 P1: SELF-IDENTITY ===
   sys += '=== YOUR IDENTITY IN THIS SPACE ===\n';
