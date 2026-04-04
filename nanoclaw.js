@@ -760,7 +760,27 @@ function resolveEntity(text, chat, tenant) {
     return 'patient:' + forName;
   }
 
-  // 3b. Known patient names in general text
+  // 3a-GRAPH. Check consciousness entityContext for patient names (THE MAP)
+  if (agentConsciousness && agentConsciousness.entityContext) {
+    for (var _ei = 0; _ei < agentConsciousness.entityContext.length; _ei++) {
+      var _edge = agentConsciousness.entityContext[_ei];
+      if (_edge.patientName && lower.includes(_edge.patientName.toLowerCase())) {
+        return 'patient:' + _edge.patientName.toLowerCase().replace(/\s+/g, '-');
+      }
+    }
+  }
+  // 3a-CACHE. Check patientNameCache (now multi-tenant from FIX C)
+  for (var _pid2 in patientNameCache) {
+    var _pname = patientNameCache[_pid2];
+    if (_pname && _pname.length > 2) {
+      var _firstName = _pname.split(' ')[0].toLowerCase();
+      if (_firstName.length > 2 && lower.includes(_firstName)) {
+        return 'patient:' + _pname.toLowerCase().replace(/\s+/g, '-');
+      }
+    }
+  }
+
+  // 3b. Known patient names in general text (LEGACY — will be replaced by cache)
   var knownPatients2 = {
     'wu siew wong': 'patient:wu-siew-wong', 'wu': 'patient:wu-siew-wong', 'madam wu': 'patient:wu-siew-wong',
     'yaya': 'patient:yaya-lee-guat-hoon', 'lee guat hoon': 'patient:yaya-lee-guat-hoon',
@@ -2043,23 +2063,10 @@ function buildSystemPrompt(persona, entityId, chatId, tenant) {
   if (agentConsciousness && agentConsciousness.behavior) {
     sys += 'BEHAVIOR: ' + agentConsciousness.behavior + '\n';
   }
-  // V12.4: Graph garden context from consciousness endpoint
-  if (agentConsciousness && agentConsciousness.topRules && agentConsciousness.topRules.length > 0) {
-    sys += "YOUR KNOWLEDGE (" + agentConsciousness.topRules.length + " rules):\n";
-    for (var _ri = 0; _ri < Math.min(agentConsciousness.topRules.length, 3); _ri++) {
-      sys += "- " + agentConsciousness.topRules[_ri].title + "\n";
-    }
-  }
-  if (agentConsciousness && agentConsciousness.toolFailures && agentConsciousness.toolFailures.length > 0) {
-    sys += "BLOCKED TOOLS (do NOT call): " + agentConsciousness.toolFailures.join(", ") + "\n";
-  }
-  if (agentConsciousness && agentConsciousness.pendingTasks && agentConsciousness.pendingTasks.length > 0) {
-    sys += "PENDING WORK: " + agentConsciousness.pendingTasks.map(function(t) { return t.type + "(" + t.status + ")"; }).join(", ") + "\n";
-  }
   if (agentConsciousness && agentConsciousness.avoid) {
     sys += 'AVOID: ' + agentConsciousness.avoid + '\n\n';
   }
-  sys += 'You are Agent 0, Chief of Staff for ' + (tenant.expertName || EXPERT_NAME) + "'s practice.\n\n";
+  sys += 'You are Agent 0, Chief of Staff for ' + (tenant.expertName || EXPERT_NAME) + "'s longevity medicine practice.\n\n";
 
   // === V12.3 P1: SELF-IDENTITY ===
   sys += '=== YOUR IDENTITY IN THIS SPACE ===\n';
@@ -2552,7 +2559,10 @@ async function loadAgentIdentity() {
     }
 
     // Load patient names (unchanged)
-    var idUrl = SUPABASE_URL + '/rest/v1/patient_identities?tenant_id=eq.' + TENANT_ID + '&preferred_name=not.is.null&select=patient_profile_id,preferred_name&limit=100';
+    // FIX C: Load patient names for ALL served tenants (not just primary)
+    var allTenantIds = Object.keys(TENANT_MCP_KEYS).concat([TENANT_ID]);
+    var uniqueTenantIds = [...new Set(allTenantIds)].filter(Boolean);
+    var idUrl = SUPABASE_URL + '/rest/v1/patient_identities?tenant_id=in.(' + uniqueTenantIds.join(',') + ')&preferred_name=not.is.null&select=patient_profile_id,preferred_name,tenant_id&limit=500';
     var identities = await httpsGet(idUrl, { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }, 5000);
     patientNameCache = {};
     if (identities) for (var id of identities) {
@@ -3330,17 +3340,24 @@ async function handleMessage(msg) {
       try {
         var freshCtx = await httpsGet(
           MOTHERSHIP + '/api/agent/consciousness?tenantId=' + tenant.tenantId,
-          { 'X-MCP-API-Key': MCP_KEY }, 3000
+          { 'X-MCP-API-Key': getMcpKey(tenant.tenantId), 'x-correlation-id': correlationId || '' }, 3000
         ).catch(function() { return null; });
         if (freshCtx && freshCtx.consciousness) {
           var fc = freshCtx.consciousness;
           if (fc.brandVoice && fc.brandVoice.tone) agentConsciousness.tone = fc.brandVoice.tone;
           if (fc.adminDirectives && fc.adminDirectives.behavior) agentConsciousness.behavior = fc.adminDirectives.behavior;
-      // V12.4: Preserve graph garden context
-      if (fc.topRules) agentConsciousness.topRules = fc.topRules;
-      if (fc.toolFailures) agentConsciousness.toolFailures = fc.toolFailures;
-      if (fc.pendingTasks) agentConsciousness.pendingTasks = fc.pendingTasks;
-      if (fc.entityContext) agentConsciousness.entityContext = fc.entityContext;
+          if (fc.adminDirectives && fc.adminDirectives.avoid) agentConsciousness.avoid = fc.adminDirectives.avoid;
+          // FIX B: Read graph garden from consciousness (Phase 2)
+          if (fc.topRules) agentConsciousness.topRules = fc.topRules;
+          if (fc.toolFailures) agentConsciousness.toolFailures = fc.toolFailures;
+          if (fc.pendingTasks) agentConsciousness.pendingTasks = fc.pendingTasks;
+          if (fc.entityContext) agentConsciousness.entityContext = fc.entityContext;
+          // FIX B2: Update patientNameCache from consciousness (per-tenant, fresh)
+          if (fc.patientName) {
+            // Single patient from consciousness — add to cache for this tenant
+            var _pid = entityId.replace('patient:', '');
+            if (_pid && fc.patientName) patientNameCache[_pid] = fc.patientName;
+          }
         }
       } catch(e) { /* non-blocking — use cached consciousness */ }
     }
@@ -3561,7 +3578,7 @@ http.createServer(function(req, res) {
   }
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
-    status: 'ok', agent: 'nanoclaw-v12.2.0-flight-recorder', messages: msgCount,
+    status: 'ok', agent: 'nanoclaw-' + NANOCLAW_VERSION, messages: msgCount,
     uptime: Math.round(process.uptime()),
     memory: { type: 'ESAGM', entities: Object.keys(entities).length }, // SEC-07: no patient names in health
     capabilities: ANTHROPIC_KEY ? 'tool_use+esagm' : 'gateway_only',
@@ -3579,7 +3596,7 @@ http.createServer(function(req, res) {
 
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', agent: 'nanoclaw-v12.2.0-flight-recorder-kiosk', tools: ALL_TOOLS.length }));
+    res.end(JSON.stringify({ status: 'ok', agent: 'nanoclaw-' + NANOCLAW_VERSION + '-kiosk', tools: ALL_TOOLS.length }));
     return;
   }
 
@@ -3599,7 +3616,7 @@ http.createServer(function(req, res) {
 }).listen(KIOSK_PORT, '0.0.0.0');
 console.log('[nc] Kiosk API on :' + KIOSK_PORT + ' (Tailscale-accessible)');
 
-console.log('[nc] NanoClaw v12.2.0-flight-recorder on :' + HEALTH_PORT);
+console.log('[nc] NanoClaw ' + NANOCLAW_VERSION + ' on :' + HEALTH_PORT);
 console.log('[nc] Persona: COS (admin) + Expert Rep (Keith Koo)');
 console.log('[nc] Memory: Entity-Scoped Attention Graph (per-patient isolation)');
 console.log('[nc] Tools: ' + (ANTHROPIC_KEY ? 'Anthropic tool_use (scoped by persona)' : 'Gateway only (no ANTHROPIC_KEY)'));
@@ -3608,6 +3625,6 @@ loadAgentIdentity().catch(function(e) { console.warn('[nc] Initial identity load
 seedBrandDNA(); // Seed DR MAGfield brand DNA into agent memory
 
 // Startup audit event
-emitAudit('nanoclaw.startup', { version: 'v12.2.0-flight-recorder', capabilities: ANTHROPIC_KEY ? 'full' : 'gateway_only', tenantId: TENANT_ID, tenantMode: process.env.TENANT_MODE || 'single', toolCount: ALL_TOOLS.length });
+emitAudit('nanoclaw.startup', { version: NANOCLAW_VERSION, capabilities: ANTHROPIC_KEY ? 'full' : 'gateway_only', tenantId: TENANT_ID, tenantMode: process.env.TENANT_MODE || 'single', toolCount: ALL_TOOLS.length });
 
 poll();
