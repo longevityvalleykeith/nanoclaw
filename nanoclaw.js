@@ -121,7 +121,7 @@ process.on('SIGINT', function() { gracefulShutdown('SIGINT'); });
 // Pattern 1: BLOCKING BUDGET — rate-limit proactive messages
 // 15-second window, max 2 proactive messages per window
 // Reactive (user-initiated) messages bypass budget entirely
-var proactiveBudget = { windowStart: 0, count: 0, WINDOW_MS: 15000, MAX_PER_WINDOW: 2 };
+var proactiveBudget = { windowStart: 0, count: 0, WINDOW_MS: 60000, MAX_PER_WINDOW: 10 };
 function canSendProactive() {
   var now = Date.now();
   if (now - proactiveBudget.windowStart > proactiveBudget.WINDOW_MS) {
@@ -2719,10 +2719,20 @@ setInterval(async function() {
   try { tenantIds = [...new Set(Object.values(CHAT_TENANT_MAP).map(function(t) { return t.tenantId; }).filter(Boolean))]; } catch(e) {}
   for (var _tid of tenantIds) {
     try {
-      var _actions = await httpsGet(MOTHERSHIP + '/api/agent/pending-actions?tenantId=' + _tid, { 'X-MCP-API-Key': getMcpKey(_tid) }, 5000);
-      if (_actions && _actions.success && _actions.items && _actions.items.length > 0) {
+      console.log("[nc] Proactive: polling pending-actions for tenant " + _tid.slice(0,8)); var _actions = await httpsGet(MOTHERSHIP + '/api/agent/pending-actions?tenantId=' + _tid, { 'x-cron-secret': process.env.CRON_SECRET || CRON_SECRET }, 5000);
+      console.log("[nc] Proactive: got " + (_actions ? (_actions.items || []).length : 0) + " items for " + _tid.slice(0,8)); if (_actions && _actions.success && _actions.items && _actions.items.length > 0) {
+        var _batchMessages = [];
         for (var _act of _actions.items) {
           var _actChat = _act.chatId || _act.chat_id;
+          // If no specific chatId, send to this tenant's admin chat
+          if (!_actChat) {
+            for (var _ck in CHAT_TENANT_MAP) {
+              if (CHAT_TENANT_MAP[_ck].tenantId === _tid && CHAT_TENANT_MAP[_ck].isAdmin) {
+                _actChat = _ck;
+                break;
+              }
+            }
+          }
           if (!_actChat) continue;
           var _actType = _act.type || _act.action_type || 'reminder';
           var _actMsg = _act.message || 'Just checking in — how are you doing?';
@@ -2757,8 +2767,19 @@ setInterval(async function() {
               _proactiveMsg = '📌 ' + _actType + ': ' + _actMsg;
           }
           if (_proactiveMsg) {
-            await sendTelegram(_actChat, _proactiveMsg);
-            emitAudit('nanoclaw.proactive_action', { type: _actType, tenantId: _tid, chatId: String(_actChat), is_proactive: true });
+            _batchMessages.push(_proactiveMsg);
+          }
+        }
+        // Send ONE batched summary per tenant (not N individual messages)
+        if (_batchMessages.length > 0 && canSendProactive()) {
+          var _adminChat2 = null;
+          for (var _ck3 in CHAT_TENANT_MAP) {
+            if (CHAT_TENANT_MAP[_ck3].tenantId === _tid && CHAT_TENANT_MAP[_ck3].isAdmin) { _adminChat2 = _ck3; break; }
+          }
+          if (_adminChat2) {
+            var _batchText = _batchMessages.length + " pending tasks:\n" + _batchMessages.slice(0, 10).join("\n");
+            await sendTelegram(_adminChat2, _batchText);
+            emitAudit("nanoclaw.proactive_action", { type: "daily_batch", tenantId: _tid, chatId: _adminChat2, count: _batchMessages.length, is_proactive: true });
           }
         }
       }
