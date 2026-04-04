@@ -2714,7 +2714,9 @@ var _v12ConfigHash = (function() {
 })();
 
 setInterval(async function() {
-  // Proactive: poll pending-actions per tenant
+  // DISABLED: Proactive daemon caused spam flood (35+ identical msgs to Sook Ping)
+  // Re-enable after idempotency + dedup + daily-only schedule implemented
+  if (true) { /* skip proactive polling */ } else { // Proactive: poll pending-actions per tenant
   var tenantIds = [];
   try { tenantIds = [...new Set(Object.values(CHAT_TENANT_MAP).map(function(t) { return t.tenantId; }).filter(Boolean))]; } catch(e) {}
   for (var _tid of tenantIds) {
@@ -2785,6 +2787,7 @@ setInterval(async function() {
       }
     } catch(e) { /* non-blocking per tenant */ }
   }
+  } // end disabled proactive block
   // Heartbeat + config manifest
   emitAudit("agent.heartbeat", {
     tenantId: TENANT_ID,
